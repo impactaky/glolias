@@ -73,7 +73,7 @@ pub fn save(allocator: std.mem.Allocator, cfg: *const Config) !void {
         };
     }
 
-    const out = try config_toml.serializeConfig(allocator, cfg.version, cfg.shims_dir, aliases);
+    const out = try config_toml.serializeConfig(allocator, cfg.version, aliases);
     defer allocator.free(out);
     try sys.writeFileTruncate(allocator, cfg.config_path, out);
 }
@@ -91,12 +91,6 @@ pub fn parse(allocator: std.mem.Allocator, config_path: []const u8, text: []cons
         .aliases = .empty,
     };
     errdefer cfg.deinit(allocator);
-
-    if (doc.shims_dir) |raw_shims_dir| {
-        const expanded = try paths.expandPath(allocator, raw_shims_dir);
-        allocator.free(cfg.shims_dir);
-        cfg.shims_dir = expanded;
-    }
 
     for (doc.aliases) |alias| {
         const owned_key = try allocator.dupe(u8, alias.name);
@@ -140,15 +134,27 @@ test "parse preserves token boundaries" {
     const allocator = std.testing.allocator;
     var cfg = try parse(allocator, "/tmp/config.toml",
         \\version = 1
-        \\shims_dir = "/tmp/glolias shims"
         \\
         \\[aliases]
         \\gh = ["echo", "a b", "-x"]
     );
     defer cfg.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/glolias shims", cfg.shims_dir);
+    const expected = try paths.defaultShimsDir(allocator);
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, cfg.shims_dir);
     const tokens = cfg.aliases.get("gh").?;
     try std.testing.expectEqual(@as(usize, 3), tokens.len);
     try std.testing.expectEqualStrings("a b", tokens[1]);
+}
+
+test "parse rejects shims_dir in config" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, parse(allocator, "/tmp/config.toml",
+        \\version = 1
+        \\shims_dir = "/tmp/machine-specific"
+        \\
+        \\[aliases]
+        \\gh = ["echo", "hi"]
+    ));
 }

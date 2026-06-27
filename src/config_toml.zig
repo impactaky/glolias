@@ -7,11 +7,9 @@ pub const Alias = struct {
 
 pub const Document = struct {
     version: u32 = 1,
-    shims_dir: ?[]const u8 = null,
     aliases: []Alias,
 
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
-        if (self.shims_dir) |value| allocator.free(value);
         for (self.aliases) |alias| {
             allocator.free(alias.name);
             for (alias.tokens) |token| allocator.free(token);
@@ -39,10 +37,8 @@ pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) !Document {
 
     var doc = Document{
         .version = 1,
-        .shims_dir = null,
         .aliases = &.{},
     };
-    errdefer if (doc.shims_dir) |value| allocator.free(value);
 
     var in_aliases = false;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -67,9 +63,6 @@ pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) !Document {
         if (!in_aliases) {
             if (std.mem.eql(u8, key, "version")) {
                 doc.version = try std.fmt.parseInt(u32, value, 10);
-            } else if (std.mem.eql(u8, key, "shims_dir")) {
-                if (doc.shims_dir) |old| allocator.free(old);
-                doc.shims_dir = try parseString(allocator, value);
             } else {
                 return error.InvalidConfig;
             }
@@ -96,16 +89,13 @@ pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) !Document {
 pub fn serializeConfig(
     allocator: std.mem.Allocator,
     version: u32,
-    shims_dir: []const u8,
     aliases: []const AliasView,
 ) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
     try out.print(allocator, "version = {d}\n", .{version});
-    try out.appendSlice(allocator, "shims_dir = \"");
-    try appendEscapedString(&out, allocator, shims_dir);
-    try out.appendSlice(allocator, "\"\n\n");
+    try out.append(allocator, '\n');
     try out.appendSlice(allocator, "[aliases]\n");
 
     for (aliases) |alias| {
@@ -264,7 +254,6 @@ test "parse and serialize glolias config schema" {
     const allocator = std.testing.allocator;
     var doc = try parseConfig(allocator,
         \\version = 1
-        \\shims_dir = "/tmp/glolias shims"
         \\
         \\[aliases]
         \\gh = ["echo", "a b", "-x"]
@@ -272,13 +261,24 @@ test "parse and serialize glolias config schema" {
     defer doc.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), doc.version);
-    try std.testing.expectEqualStrings("/tmp/glolias shims", doc.shims_dir.?);
     try std.testing.expectEqual(@as(usize, 1), doc.aliases.len);
     try std.testing.expectEqualStrings("a b", doc.aliases[0].tokens[1]);
 
-    const text = try serializeConfig(allocator, doc.version, doc.shims_dir.?, &.{
+    const text = try serializeConfig(allocator, doc.version, &.{
         .{ .name = doc.aliases[0].name, .tokens = doc.aliases[0].tokens },
     });
     defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "shims_dir") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "gh = [\"echo\", \"a b\", \"-x\"]") != null);
+}
+
+test "shims_dir is not part of the config schema" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, parseConfig(allocator,
+        \\version = 1
+        \\shims_dir = "/tmp/machine-specific"
+        \\
+        \\[aliases]
+        \\gh = ["echo", "hi"]
+    ));
 }

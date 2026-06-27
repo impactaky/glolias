@@ -18,7 +18,7 @@ A named mapping from a command name to a **token list** (the replacement `argv` 
 Explicitly out of scope: interior placeholders (`$1`, `$@` in the middle) and positional consumption. An Alias only ever prepends.
 
 ### Shims directory
-The single directory that `glolias` owns and populates with the symlinks (one per Alias) pointing at the dispatcher binary. Its location is **configurable** (a top-level `shims_dir` field in the config), defaulting to the XDG data path; users may repoint it at a directory already on their environments' `PATH`. For Shims to take effect, the user must place this directory on `PATH` ahead of the real commands it shadows. `glolias` reports this directory and can diagnose `PATH` ordering, but does **not** modify the user's environment itself — putting it on `PATH` is the user's responsibility.
+The single directory that `glolias` owns and populates with the symlinks (one per Alias) pointing at the dispatcher binary. Its location follows the XDG data path (`${XDG_DATA_HOME:-~/.local/share}/glolias/shims`) so the config stays portable across machines. For Shims to take effect, the user must place this directory on `PATH` ahead of the real commands it shadows. `glolias` reports this directory and can diagnose `PATH` ordering, but does **not** modify the user's environment itself — putting it on `PATH` is the user's responsibility.
 
 ### Real command
 The genuine executable that a Shim ultimately reroutes to (e.g. the actual `/usr/bin/gh`). Distinct from the Shim that shadows its name. Resolving the Real command without re-invoking the Shim (infinite recursion) is a core concern — see ADRs.

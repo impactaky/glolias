@@ -4,18 +4,17 @@ Alias definitions live in a single TOML file (`${XDG_CONFIG_HOME:-~/.config}/glo
 
 ```toml
 version = 1
-shims_dir = "~/.local/share/glolias/shims"   # optional; default shown (XDG data). Tilde/$HOME expanded.
 
 [aliases]
 gh = ["op", "plugin", "run", "--", "gh"]
 gs = ["git", "status"]
 ```
 
-The optional top-level `shims_dir` lets the user repoint the Shims directory at a path already on their environments' `PATH`; it defaults to `${XDG_DATA_HOME:-~/.local/share}/glolias/shims`. Keeping it in the config means the dispatcher reads a single file for everything it needs at runtime — the Alias tokens *and* the Shims directory to exclude during Real-command resolution (ADR 0002).
+The Shims directory is derived from `${XDG_DATA_HOME:-~/.local/share}/glolias/shims` rather than stored in the config. This keeps the config portable across machines: moving the shims location is an environment concern, handled by `XDG_DATA_HOME`, while the config remains only the alias mapping.
 
 ## Considered Options
 
-- **TOML subset (chosen)** — human-friendly, native string arrays store tokens losslessly, and the project only needs `version`, `shims_dir`, and an `[aliases]` table. Cost: a small internal parser/serializer rather than a full TOML implementation.
+- **TOML subset (chosen)** — human-friendly, native string arrays store tokens losslessly, and the project only needs `version` and an `[aliases]` table. Cost: a small internal parser/serializer rather than a full TOML implementation.
 - **`std.json`** — zero dependencies and trivially correct round-trip, but config-as-JSON is unpleasant to hand-edit.
 - **Line-based `name = command`** — most pleasant to hand-edit, but forces a hand-rolled shell-quoting parser *and* a mirror-image serializer that must agree forever; rejected.
 - **YAML** — no maintained Zig serializer and overkill for a flat name→list map; rejected.

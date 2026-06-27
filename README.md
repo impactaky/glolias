@@ -69,8 +69,9 @@ zig-out/bin/glolias
 Run tests:
 
 ```sh
-zig build test
-tests/e2e.sh
+zig build test                 # unit tests
+git submodule update --init    # first time only
+zig build e2e                  # end-to-end (bats)
 ```
 
 The project includes a small internal TOML subset parser for the
@@ -95,11 +96,11 @@ Default paths:
 - Config: `${XDG_CONFIG_HOME:-~/.config}/glolias/config.toml`
 - Shims: `${XDG_DATA_HOME:-~/.local/share}/glolias/shims`
 
-You can override the shims directory in the config:
+Set `XDG_DATA_HOME` to move the shims directory. The config stays portable and
+does not store the expanded shims path:
 
 ```toml
 version = 1
-shims_dir = "~/.local/share/glolias/shims"
 
 [aliases]
 gh = ["op", "plugin", "run", "--", "gh"]
