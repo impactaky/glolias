@@ -12,5 +12,5 @@ An explicit, opt-in setup utility for the standard Linux and macOS environment p
 
 - Environment changes must remain explicit: a future setup utility may edit standard shell/session configuration, but ordinary installation and alias-management commands must not.
 - Existing shell aliases and functions remain outside glolias ownership. glolias does not detect, remove, or migrate them; users decide whether and when to replace those definitions with Global Aliases.
-- `glolias doctor` diagnoses only the `PATH`/environment of the shell it runs in; it cannot inspect a GUI-launched IDE's environment. Confirming the shim is reachable from the IDE is left to the user (no probe/self-test is built).
+- `glolias doctor` diagnoses only the `PATH`/environment of the shell it runs in; it cannot inspect a GUI-launched IDE's environment. Confirming the shim is reachable from the IDE is left to the user (no probe/self-test is built). Its read-only health-check and exit-status contract is defined in ADR 0008.
 - Cross-platform executable-path resolution is the known seam to generalize when macOS support lands.

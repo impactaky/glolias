@@ -178,16 +178,25 @@ Removing a missing alias is an error.
 
 ### `doctor`
 
-Checks the current shell environment:
+Performs a read-only health check of the current shell environment:
 
-- Config parse status
-- Whether the shims directory exists
+- Whether the config exists and parses successfully
+- Whether the shims path resolves to a directory
 - Whether the shims directory is on `PATH`
 - Whether another executable shadows a shim before the shims directory
-- Orphan symlinks
+- Whether every configured Alias has a symlink pointing at the current `glolias`
+  binary (including missing, dangling, stale, or non-symlink entries)
+- Whether the shims directory contains orphan symlinks with no config entry
 
-`doctor` reports only the environment of the shell that runs it. GUI-launched
-applications and IDEs may have a different `PATH`.
+`doctor` runs every check that remains possible after an error and reports all
+inconsistencies found. It exits `0` for a healthy setup and `1` if it finds one
+or more inconsistencies, making it suitable for scripts. Reported shim
+inconsistencies include guidance to run `glolias sync`; a blocking regular file
+or directory must be removed first.
+
+The command does not repair shims or change config or `PATH`. It reports only
+the environment of the shell that runs it. GUI-launched applications and IDEs
+may have a different `PATH`.
 
 ## Dispatch Behavior
 
@@ -222,6 +231,7 @@ Background and rationale are in:
 - [docs/adr/0003-toml-machine-managed-config.md](./docs/adr/0003-toml-machine-managed-config.md)
 - [docs/adr/0004-linux-first-no-environment-management.md](./docs/adr/0004-linux-first-no-environment-management.md)
 - [docs/adr/0005-transparent-execv-no-fork.md](./docs/adr/0005-transparent-execv-no-fork.md)
+- [docs/adr/0008-doctor-is-a-read-only-health-check.md](./docs/adr/0008-doctor-is-a-read-only-health-check.md)
 
 Current scope:
 

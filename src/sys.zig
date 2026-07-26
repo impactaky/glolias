@@ -133,6 +133,39 @@ pub fn isExecutableFile(allocator: std.mem.Allocator, path: []const u8) bool {
     return c.access(z_path.ptr, c.X_OK) == 0;
 }
 
+pub const PathKind = enum {
+    missing,
+    symlink,
+    directory,
+    regular_file,
+    other,
+};
+
+pub fn pathKind(allocator: std.mem.Allocator, path: []const u8) !PathKind {
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+
+    var info = std.mem.zeroes(std.os.linux.Statx);
+    if (c.statx(
+        c.AT.FDCWD,
+        z_path.ptr,
+        c.AT.SYMLINK_NOFOLLOW,
+        .{ .TYPE = true },
+        &info,
+    ) != 0) {
+        return switch (c.errno(-1)) {
+            .NOENT, .NOTDIR => .missing,
+            else => error.StatFailed,
+        };
+    }
+
+    const mode: c.mode_t = info.mode;
+    if (c.S.ISLNK(mode)) return .symlink;
+    if (c.S.ISDIR(mode)) return .directory;
+    if (c.S.ISREG(mode)) return .regular_file;
+    return .other;
+}
+
 pub fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const z_path = try allocator.dupeZ(u8, path);
     defer allocator.free(z_path);

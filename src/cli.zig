@@ -32,7 +32,7 @@ const commands = [_]CmdInfo{
     .{ .tag = .sync, .name = "sync", .usage_args = "", .summary = "Recreate/prune shims to match config", .run = sync },
     .{ .tag = .list, .name = "list", .usage_args = "[--plain]", .summary = "List configured aliases", .run = list },
     .{ .tag = .path, .name = "path", .usage_args = "", .summary = "Print the shims directory", .run = printPath },
-    .{ .tag = .doctor, .name = "doctor", .usage_args = "", .summary = "Diagnose PATH and shim setup", .run = doctor },
+    .{ .tag = .doctor, .name = "doctor", .usage_args = "", .summary = "Check setup; exit 1 on inconsistencies", .run = doctor },
 };
 
 const command_params = clap.parseParamsComptime(
@@ -393,18 +393,41 @@ fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     try main.stdout(allocator, "doctor: current shell environment only; GUI IDE environments may differ\n", .{});
 
-    var cfg = config.load(allocator) catch |err| {
-        try main.stdout(allocator, "config: error: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer cfg.deinit(allocator);
-    try main.stdout(allocator, "config: ok\n", .{});
+    var inconsistent = false;
+    var shim_inconsistent = false;
 
-    if (sys.isDir(allocator, cfg.shims_dir)) {
-        try main.stdout(allocator, "shims_dir: ok: {s}\n", .{cfg.shims_dir});
-    } else {
-        try main.stdout(allocator, "shims_dir: missing or not a directory: {s}\n", .{cfg.shims_dir});
-    }
+    var cfg_opt: ?config.Config = config.load(allocator) catch |err| blk: {
+        try main.stdout(allocator, "config: error: {s}\n", .{@errorName(err)});
+        inconsistent = true;
+        break :blk null;
+    };
+    defer if (cfg_opt) |*cfg| cfg.deinit(allocator);
+    if (cfg_opt != null) try main.stdout(allocator, "config: ok\n", .{});
+
+    const shims_dir = try paths.defaultShimsDir(allocator);
+    defer allocator.free(shims_dir);
+
+    const shims_kind = sys.pathKind(allocator, shims_dir) catch |err| blk: {
+        try main.stdout(allocator, "shims_dir: unable to inspect: {s}: {s}\n", .{ shims_dir, @errorName(err) });
+        inconsistent = true;
+        shim_inconsistent = true;
+        break :blk null;
+    };
+    const shims_is_dir = sys.isDir(allocator, shims_dir);
+    if (shims_is_dir) {
+        try main.stdout(allocator, "shims_dir: ok: {s}\n", .{shims_dir});
+    } else if (shims_kind) |kind| switch (kind) {
+        .missing => {
+            try main.stdout(allocator, "shims_dir: missing: {s}\n", .{shims_dir});
+            inconsistent = true;
+            shim_inconsistent = true;
+        },
+        else => {
+            try main.stdout(allocator, "shims_dir: not a directory ({s}): {s}\n", .{ pathKindName(kind), shims_dir });
+            inconsistent = true;
+            shim_inconsistent = true;
+        },
+    };
 
     const path_value = sys.getenvOwned(allocator, "PATH") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, ""),
@@ -412,45 +435,169 @@ fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer allocator.free(path_value);
 
-    const shims_index = findPathIndex(allocator, path_value, cfg.shims_dir);
+    const shims_index = findPathIndex(allocator, path_value, shims_dir);
     if (shims_index) |idx| {
         try main.stdout(allocator, "path: shims_dir present at position {d}\n", .{idx});
     } else {
         try main.stdout(allocator, "path: shims_dir is not on PATH\n", .{});
+        inconsistent = true;
     }
 
-    var aliases = cfg.aliases.iterator();
-    while (aliases.next()) |entry| {
-        if (findFirstExecutableDir(allocator, path_value, entry.key_ptr.*)) |found| {
-            defer allocator.free(found.dir);
-            if (shims_index) |idx| {
-                if (found.index < idx) {
-                    try main.stdout(allocator, "shadowing: {s} is shadowed by {s}/{s}\n", .{ entry.key_ptr.*, found.dir, entry.key_ptr.* });
+    if (cfg_opt) |*cfg| {
+        var aliases = cfg.aliases.iterator();
+        while (aliases.next()) |entry| {
+            if (findFirstExecutableDir(allocator, path_value, entry.key_ptr.*)) |found| {
+                defer allocator.free(found.dir);
+                if (shims_index) |idx| {
+                    if (found.index < idx) {
+                        try main.stdout(allocator, "shadowing: {s} is shadowed by {s}/{s}\n", .{ entry.key_ptr.*, found.dir, entry.key_ptr.* });
+                        inconsistent = true;
+                    }
                 }
             }
         }
     }
 
-    const symlinks = sys.listSymlinks(allocator, cfg.shims_dir) catch |err| switch (err) {
-        error.OpenDirFailed => {
-            try main.stdout(allocator, "orphans: unable to inspect shims_dir\n", .{});
-            return;
-        },
-        else => return err,
+    const current_binary = paths.selfExePath(allocator) catch |err| blk: {
+        try main.stdout(allocator, "binary: unable to resolve current glolias binary: {s}\n", .{@errorName(err)});
+        inconsistent = true;
+        break :blk null;
     };
-    defer {
-        for (symlinks) |entry_name| allocator.free(entry_name);
-        allocator.free(symlinks);
-    }
+    defer if (current_binary) |binary| allocator.free(binary);
 
-    var orphan_count: usize = 0;
-    for (symlinks) |entry_name| {
-        if (!cfg.aliases.contains(entry_name)) {
-            orphan_count += 1;
-            try main.stdout(allocator, "orphan: {s}\n", .{entry_name});
+    if (cfg_opt) |*cfg| {
+        var aliases = cfg.aliases.iterator();
+        while (aliases.next()) |entry| {
+            const bad_shim = try diagnoseConfiguredShim(
+                allocator,
+                shims_dir,
+                entry.key_ptr.*,
+                current_binary,
+            );
+            if (bad_shim) {
+                inconsistent = true;
+                shim_inconsistent = true;
+            }
         }
     }
-    if (orphan_count == 0) try main.stdout(allocator, "orphans: none\n", .{});
+
+    if (shims_is_dir) {
+        const symlinks = sys.listSymlinks(allocator, shims_dir) catch |err| switch (err) {
+            error.OpenDirFailed => blk: {
+                try main.stdout(allocator, "shims: unable to inspect shims_dir\n", .{});
+                inconsistent = true;
+                shim_inconsistent = true;
+                break :blk null;
+            },
+            else => return err,
+        };
+        defer if (symlinks) |entries| {
+            for (entries) |entry_name| allocator.free(entry_name);
+            allocator.free(entries);
+        };
+
+        if (symlinks) |entries| {
+            if (cfg_opt) |*cfg| {
+                var orphan_count: usize = 0;
+                for (entries) |entry_name| {
+                    if (!cfg.aliases.contains(entry_name)) {
+                        orphan_count += 1;
+                        try main.stdout(allocator, "orphan: {s}\n", .{entry_name});
+                    }
+                }
+                if (orphan_count == 0) {
+                    try main.stdout(allocator, "orphans: none\n", .{});
+                } else {
+                    inconsistent = true;
+                    shim_inconsistent = true;
+                }
+            } else {
+                for (entries) |entry_name| {
+                    const link_path = try std.fs.path.join(allocator, &.{ shims_dir, entry_name });
+                    defer allocator.free(link_path);
+                    if (try diagnoseSymlinkTarget(allocator, link_path, entry_name, current_binary)) {
+                        inconsistent = true;
+                        shim_inconsistent = true;
+                    }
+                }
+                try main.stdout(allocator, "orphans: skipped because config is unavailable\n", .{});
+            }
+        }
+    }
+
+    if (shim_inconsistent) {
+        try main.stdout(allocator, "repair: run 'glolias sync' to repair shims (remove blocking files or directories first)\n", .{});
+    }
+
+    if (inconsistent) {
+        try main.stdout(allocator, "doctor: inconsistencies found\n", .{});
+        std.process.exit(1);
+    }
+    try main.stdout(allocator, "doctor: ok\n", .{});
+}
+
+fn diagnoseConfiguredShim(
+    allocator: std.mem.Allocator,
+    shims_dir: []const u8,
+    name: []const u8,
+    current_binary: ?[]const u8,
+) !bool {
+    const link_path = try std.fs.path.join(allocator, &.{ shims_dir, name });
+    defer allocator.free(link_path);
+
+    const kind = sys.pathKind(allocator, link_path) catch |err| {
+        try main.stdout(allocator, "shim: {s}: unable to inspect: {s}\n", .{ name, @errorName(err) });
+        return true;
+    };
+    return switch (kind) {
+        .missing => blk: {
+            try main.stdout(allocator, "shim: {s}: missing\n", .{name});
+            break :blk true;
+        },
+        .symlink => diagnoseSymlinkTarget(allocator, link_path, name, current_binary),
+        .directory => blk: {
+            try main.stdout(allocator, "shim: {s}: not a symlink (directory)\n", .{name});
+            break :blk true;
+        },
+        .regular_file => blk: {
+            try main.stdout(allocator, "shim: {s}: not a symlink (regular file)\n", .{name});
+            break :blk true;
+        },
+        .other => blk: {
+            try main.stdout(allocator, "shim: {s}: not a symlink (other file type)\n", .{name});
+            break :blk true;
+        },
+    };
+}
+
+fn diagnoseSymlinkTarget(
+    allocator: std.mem.Allocator,
+    link_path: []const u8,
+    name: []const u8,
+    current_binary: ?[]const u8,
+) !bool {
+    const resolved = sys.realpathAlloc(allocator, link_path) catch {
+        try main.stdout(allocator, "shim: {s}: dangling or unresolvable symlink\n", .{name});
+        return true;
+    };
+    defer allocator.free(resolved);
+
+    const binary = current_binary orelse return false;
+    if (!std.mem.eql(u8, resolved, binary)) {
+        try main.stdout(allocator, "shim: {s}: points to a different glolias binary: {s}\n", .{ name, resolved });
+        return true;
+    }
+    return false;
+}
+
+fn pathKindName(kind: sys.PathKind) []const u8 {
+    return switch (kind) {
+        .missing => "missing",
+        .symlink => "symlink",
+        .directory => "directory",
+        .regular_file => "regular file",
+        .other => "other file type",
+    };
 }
 
 fn parseNoArgCommand(allocator: std.mem.Allocator, args: []const []const u8, comptime command_name: []const u8) void {
@@ -513,7 +660,11 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
         ) catch {},
         .doctor => writer.writeAll(
             \\
-            \\This diagnosis reflects the current shell environment only; GUI IDE
+            \\Runs every inspectable check without changing config, shims, or PATH.
+            \\Exits 0 when the setup is healthy and 1 when any inconsistency is found.
+            \\Run 'glolias sync' to repair reported shim inconsistencies.
+            \\
+            \\The diagnosis reflects the current shell environment only; GUI IDE
             \\environments may differ.
             \\
         ) catch {},

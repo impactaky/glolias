@@ -62,6 +62,8 @@ load test_helper/common
   run --separate-stderr glolias help doctor
   assert_success
   refute_stderr
+  assert_output --partial "Exits 0 when the setup is healthy and 1 when any inconsistency is found."
+  assert_output --partial "glolias sync"
   assert_output --partial "current shell environment only"
 
   run --separate-stderr glolias list --help
