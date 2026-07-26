@@ -1,4 +1,5 @@
 const std = @import("std");
+const alias_name = @import("alias_name.zig");
 
 pub const Alias = struct {
     name: []const u8,
@@ -67,7 +68,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) !Document {
                 return error.InvalidConfig;
             }
         } else {
-            try validateBareKey(key);
+            try alias_name.validate(key);
             const owned_name = try allocator.dupe(u8, key);
             errdefer allocator.free(owned_name);
             const tokens = try parseStringArray(allocator, value);
@@ -99,7 +100,7 @@ pub fn serializeConfig(
     try out.appendSlice(allocator, "[aliases]\n");
 
     for (aliases) |alias| {
-        try validateBareKey(alias.name);
+        try alias_name.validate(alias.name);
         try out.appendSlice(allocator, alias.name);
         try out.appendSlice(allocator, " = [");
         for (alias.tokens, 0..) |token, i| {
@@ -237,15 +238,6 @@ fn appendEscapedString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, va
     }
 }
 
-fn validateBareKey(key: []const u8) !void {
-    if (key.len == 0) return error.InvalidBareKey;
-    for (key) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') {
-            return error.InvalidBareKey;
-        }
-    }
-}
-
 fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
@@ -281,4 +273,32 @@ test "shims_dir is not part of the config schema" {
         \\[aliases]
         \\gh = ["echo", "hi"]
     ));
+}
+
+test "parser and serializer apply the Alias name contract" {
+    const allocator = std.testing.allocator;
+    const tokens = [_][]const u8{"echo"};
+    for ([_][]const u8{ "a", "A0", "_local", "foo-bar" }) |name| {
+        const text = try serializeConfig(allocator, 1, &.{
+            .{ .name = name, .tokens = &tokens },
+        });
+        defer allocator.free(text);
+
+        var doc = try parseConfig(allocator, text);
+        defer doc.deinit(allocator);
+        try std.testing.expectEqualStrings(name, doc.aliases[0].name);
+    }
+
+    const invalid_cases = [_]struct { name: []const u8, expected: anyerror }{
+        .{ .name = "", .expected = error.EmptyName },
+        .{ .name = "glolias", .expected = error.ReservedName },
+        .{ .name = "-x", .expected = error.InvalidInitialCharacter },
+        .{ .name = "foo.bar", .expected = error.InvalidCharacter },
+        .{ .name = "é", .expected = error.InvalidInitialCharacter },
+    };
+    for (invalid_cases) |case| {
+        try std.testing.expectError(case.expected, serializeConfig(allocator, 1, &.{
+            .{ .name = case.name, .tokens = &tokens },
+        }));
+    }
 }

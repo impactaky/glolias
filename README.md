@@ -137,8 +137,9 @@ Re-adding the same tokens succeeds. Replacing different tokens requires
 glolias add --force gh gh --default
 ```
 
-Invalid alias names are rejected: `glolias`, empty names, names containing `/`,
-and names beginning with `-`.
+Alias names must match `[A-Za-z0-9_][A-Za-z0-9_-]*`; `glolias` is reserved.
+Names containing `.`, Unicode, whitespace, `:`, `/`, or other characters
+outside that ASCII form are rejected. Quoted TOML keys are not supported.
 
 ### `sync`
 

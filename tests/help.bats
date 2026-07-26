@@ -49,6 +49,8 @@ load test_helper/common
   run --separate-stderr glolias add --help
   assert_success
   refute_stderr
+  assert_output --partial "Alias names must match [A-Za-z0-9_][A-Za-z0-9_-]*"
+  assert_output --partial "'glolias' is reserved"
   assert_output --partial "Tokens after <name> are stored verbatim"
 
   run glolias add gh curl --help

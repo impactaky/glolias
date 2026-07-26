@@ -10,6 +10,15 @@ load test_helper/common
   assert_shim_points_to_current_binary gh
 }
 
+@test "all supported Alias name boundary forms save and create shims" {
+  for name in "a" "A0" "_local" "foo-bar"
+  do
+    glolias add "$name" echo "$name"
+    assert_config_line "$name = [\"echo\", \"$name\"]"
+    assert_shim_points_to_current_binary "$name"
+  done
+}
+
 @test "leading-dash command tokens are stored verbatim" {
   glolias add gs git -c color.ui=always status
   glolias add hh curl --help
@@ -32,12 +41,73 @@ load test_helper/common
   assert_config_line 'gh = ["echo", "OTHER"]'
 }
 
-@test "alias names reject reserved and degenerate forms" {
-  for name in "glolias" "a/b" "" "-x"
+@test "unsupported Alias names fail before changing config or shims" {
+  glolias add keep echo stable
+  config_before="$(cat "$(config_file)")"
+  shims_before="$(find "$(shims_dir)" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+
+  for name in "" "glolias" "-x" "a/b" "." "a b" "a:b" "é"
   do
     run --separate-stderr glolias add "$name" echo value
-    assert_failure
+
+    assert_equal "$status" 2
+    refute_output
+    if [ -z "$name" ]
+    then
+      assert_stderr --partial "invalid alias name ''"
+    elif [[ "$name" == -* ]]
+    then
+      assert_stderr --partial "Invalid argument '$name'"
+    else
+      assert_stderr --partial "invalid alias name '$name'"
+    fi
+    assert_stderr --partial "[A-Za-z0-9_][A-Za-z0-9_-]*"
+    assert_equal "$(cat "$(config_file)")" "$config_before"
+    assert_equal "$(find "$(shims_dir)" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" "$shims_before"
   done
+}
+
+@test "foo.bar is a normal input error, not a serializer crash" {
+  run --separate-stderr glolias add foo.bar echo value
+
+  assert_equal "$status" 2
+  refute_output
+  assert_stderr --partial "invalid alias name 'foo.bar'"
+  assert_stderr --partial "[A-Za-z0-9_][A-Za-z0-9_-]*"
+  refute_stderr --partial "Double free"
+  assert [ ! -e "$(config_file)" ]
+  assert [ ! -e "$(shims_dir)/foo.bar" ]
+}
+
+@test "config save failure after Alias insertion exits normally" {
+  glolias add keep echo stable
+  chmod 0444 "$(config_file)"
+
+  run --separate-stderr glolias add unsaved echo value
+
+  assert_equal "$status" 1
+  refute_output
+  refute_stderr --partial "error(DebugAllocator)"
+  refute_stderr --partial "Double free"
+  refute_stderr --partial "General protection exception"
+  refute_stderr --partial "Segmentation fault"
+  refute_config_line "unsaved = "
+  assert [ ! -e "$(shims_dir)/unsaved" ]
+}
+
+@test "shim creation failure after Alias insertion exits normally" {
+  mkdir -p "$(shims_dir)/blocked"
+
+  run --separate-stderr glolias add blocked echo value
+
+  assert_equal "$status" 1
+  refute_output
+  refute_stderr --partial "error(DebugAllocator)"
+  refute_stderr --partial "Double free"
+  refute_stderr --partial "General protection exception"
+  refute_stderr --partial "Segmentation fault"
+  assert_config_line 'blocked = ["echo", "value"]'
+  assert [ ! -L "$(shims_dir)/blocked" ]
 }
 
 @test "list shows aligned rows for people" {

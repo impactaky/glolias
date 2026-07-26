@@ -4,10 +4,13 @@ The shared language of this project. Glossary only — no implementation details
 
 ## Terms
 
-### Shim
-A real, `PATH`-resident executable that **shadows** a command name (e.g. `gh`) by sitting on `PATH` ahead of the real command, intercepts every invocation of that name, and reroutes it to a different command line. Unlike a shell `alias`, a Shim works in *any* `execv` context — scripts, IDEs, other programs — because it is an actual executable, not a shell-interactive construct.
+### Global Alias
+An Alias available consistently across one user's execution contexts, including shells, scripts, IDEs, and GUI-launched tools. “Global” means cross-context for that user, not system-wide across every user on a machine.
 
-> Motivating case: an IDE calls `gh` directly via `execvp` and never sources the user's zshrc, so a shell `alias gh='op plugin run -- gh'` does not apply. A Shim named `gh` on `PATH` does.
+### Shim
+A real, `PATH`-resident executable that **shadows** a command name (e.g. `gh`) by sitting on `PATH` ahead of the real command, intercepts every invocation of that name, and reroutes it to a different command line. Unlike a shell `alias`, a Shim works in *any* `execv` context — scripts, IDEs, other programs — because it is an actual executable, not a shell-interactive construct. It intercepts only name-based `PATH` resolution; an explicit absolute or relative executable path bypasses the Shim.
+
+> Motivating case: an app such as Codex calls `gh` directly via `execvp`, so zsh never parses that invocation and `alias gh='op plugin run -- gh'` does not apply. Shell aliases are not inherited by child processes, so this remains true even when the app itself was launched from zsh. A Shim named `gh` on `PATH` does apply.
 
 ### Alias
 A named mapping from a command name to a **token list** (the replacement `argv` head). When the Shim for that name runs, it builds the new argument vector as `tokens ++ original_args` and execs it. Pure append: original args are passed through unchanged, never re-split, never spliced into the interior of the token list. This mirrors shell `alias` semantics (prefix substitution) but without re-word-splitting.

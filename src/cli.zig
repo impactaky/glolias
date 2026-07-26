@@ -2,6 +2,7 @@ const std = @import("std");
 
 const clap = @import("clap");
 
+const alias_name = @import("alias_name.zig");
 const config = @import("config.zig");
 const main = @import("main.zig");
 const paths = @import("paths.zig");
@@ -206,8 +207,8 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (tokens.len == 0) {
         failUsageWithHelp("glolias: add requires <name> and <command>\n", "glolias add", &add_params);
     }
-    validateName(name) catch |err| {
-        main.fail("glolias: invalid alias name '{s}': {s}\n", .{ name, @errorName(err) }, 2);
+    validateName(name) catch {
+        main.fail("glolias: invalid alias name '{s}': {s}\n", .{ name, alias_name.contract }, 2);
     };
 
     var cfg = try config.loadOrInit(allocator);
@@ -229,11 +230,7 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    const owned_name = try allocator.dupe(u8, name);
-    errdefer allocator.free(owned_name);
-    const owned_tokens = try copyTokens(allocator, tokens);
-    errdefer freeTokens(allocator, owned_tokens);
-    try cfg.aliases.put(allocator, owned_name, owned_tokens);
+    try putOwnedAlias(allocator, &cfg.aliases, name, tokens);
 
     try config.save(allocator, &cfg);
     try ensureSymlink(allocator, cfg.shims_dir, name);
@@ -507,6 +504,9 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
     switch (info.tag) {
         .add => writer.writeAll(
             \\
+            \\Alias names must match [A-Za-z0-9_][A-Za-z0-9_-]*;
+            \\'glolias' is reserved.
+            \\
             \\Tokens after <name> are stored verbatim; leading-dash args are safe
             \\and not parsed by glolias.
             \\
@@ -581,10 +581,7 @@ fn commandInfoFromContext(comptime context: []const u8) ?*const CmdInfo {
 }
 
 pub fn validateName(name: []const u8) !void {
-    if (name.len == 0) return error.EmptyName;
-    if (std.mem.eql(u8, name, "glolias")) return error.ReservedName;
-    if (std.mem.indexOfScalar(u8, name, '/') != null) return error.ContainsSlash;
-    if (name[0] == '-') return error.LeadingDash;
+    try alias_name.validate(name);
 }
 
 fn ensureSymlink(allocator: std.mem.Allocator, shims_dir: []const u8, name: []const u8) !void {
@@ -609,6 +606,21 @@ fn copyTokens(allocator: std.mem.Allocator, tokens: []const []const u8) ![][]con
         out[i] = try allocator.dupe(u8, token);
     }
     return out;
+}
+
+fn putOwnedAlias(
+    allocator: std.mem.Allocator,
+    aliases: *config.AliasMap,
+    name: []const u8,
+    tokens: []const []const u8,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_tokens = try copyTokens(allocator, tokens);
+    errdefer freeTokens(allocator, owned_tokens);
+
+    // A successful put transfers both allocations to Config.deinit.
+    try aliases.put(allocator, owned_name, owned_tokens);
 }
 
 fn freeTokens(allocator: std.mem.Allocator, tokens: [][]const u8) void {
@@ -664,10 +676,12 @@ fn sameDir(allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8) bool 
     return std.mem.eql(u8, lhs_real, rhs_real);
 }
 
-test "validateName rejects reserved and degenerate names" {
+test "validateName applies the shared Alias name contract" {
+    for ([_][]const u8{ "a", "A0", "_local", "foo-bar" }) |name| {
+        try validateName(name);
+    }
     try std.testing.expectError(error.EmptyName, validateName(""));
     try std.testing.expectError(error.ReservedName, validateName("glolias"));
-    try std.testing.expectError(error.ContainsSlash, validateName("a/b"));
-    try std.testing.expectError(error.LeadingDash, validateName("-x"));
-    try validateName("gh");
+    try std.testing.expectError(error.InvalidInitialCharacter, validateName("-x"));
+    try std.testing.expectError(error.InvalidCharacter, validateName("foo.bar"));
 }
