@@ -49,55 +49,69 @@ quoting is preserved.
 
 ## Build
 
-Requirements:
-
-- Linux
-- Zig 0.16
-
-Build:
+Building from source requires Zig 0.16 on Linux or macOS:
 
 ```sh
 zig build
 ```
 
-The binary is written to:
-
-```sh
-zig-out/bin/glolias
-```
-
-Run tests:
+The native binary is written to `zig-out/bin/glolias`. Run the test suites with:
 
 ```sh
 zig build test                 # unit tests
 git submodule update --init    # first time only
-zig build e2e                  # end-to-end (bats)
+zig build e2e                  # end-to-end tests with Bats
 ```
 
-The project includes a small internal TOML subset parser for the
-machine-managed config schema. CLI argument parsing uses `zig-clap`, fetched by
-Zig from `build.zig.zon`.
+The project includes a small internal TOML subset parser for the machine-managed
+config schema. CLI argument parsing uses `zig-clap`, fetched by Zig from
+`build.zig.zon`.
 
 ## Install
 
-Copy or symlink `zig-out/bin/glolias` somewhere stable on your system, then run:
+Release version 0.1.0 provides these archives:
+
+| Archive suffix | Runtime baseline |
+| --- | --- |
+| `linux-x86_64` | static musl, x86-64 Linux |
+| `linux-aarch64` | static musl, AArch64 Linux |
+| `macos-x86_64` | macOS 14 or later, Intel |
+| `macos-aarch64` | macOS 14 or later, Apple silicon |
+
+Download the archive for your platform together with `SHA256SUMS` from the
+GitHub Release. Verify the selected archive before extracting it. For example:
 
 ```sh
-glolias add gh op plugin run -- gh
-glolias path
+# Linux
+grep 'glolias-v0.1.0-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
+
+# macOS
+grep 'glolias-v0.1.0-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check
 ```
 
-Add the printed shims directory to `PATH` ahead of the real commands it should
-shadow. `glolias` deliberately does not edit shell profiles, desktop session
-files, or other environment configuration.
+Extract it, place `glolias` at a stable user-selected location already on
+`PATH`, and then preview persistent setup:
+
+```sh
+tar -xzf glolias-v0.1.0-linux-x86_64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 glolias "$HOME/.local/bin/glolias"
+
+glolias setup
+glolias setup --apply
+glolias add gh op plugin run -- gh
+```
+
+Installation, `add`, `remove`, `sync`, and dispatch never run setup implicitly.
+There is no network installer or `curl | sh` path.
 
 Default paths:
 
 - Config: `${XDG_CONFIG_HOME:-~/.config}/glolias/config.toml`
-- Shims: `${XDG_DATA_HOME:-~/.local/share}/glolias/shims`
+- Shims directory: `${XDG_DATA_HOME:-~/.local/share}/glolias/shims`
 
-Set `XDG_DATA_HOME` to move the shims directory. The config stays portable and
-does not store the expanded shims path:
+Set `XDG_DATA_HOME` to move the Shims directory. The config stays portable and
+does not store the expanded path:
 
 ```toml
 version = 1
@@ -107,6 +121,50 @@ gh = ["op", "plugin", "run", "--", "gh"]
 gs = ["git", "status"]
 ```
 
+## Persistent setup
+
+`setup` is preview-first and non-interactive:
+
+```sh
+glolias setup                    # preview additions; read-only
+glolias setup --apply            # apply those additions
+glolias setup --remove           # preview owned-state removal; read-only
+glolias setup --remove --apply   # remove only owned setup state
+```
+
+Every plan prints each target path, exact managed content or removal action,
+no-op, manual step, and conflict. `--apply` is the only mutation authorization.
+All targets are preflighted before the first write. A conflict changes nothing;
+each later file change is atomic, and a filesystem failure reports applied,
+failed, and pending actions so rerunning the command converges.
+
+Setup targets only files owned by the current user:
+
+- `.profile` for Bash/POSIX login shells
+- `.zprofile` for Zsh login shells
+- `${XDG_CONFIG_HOME:-~/.config}/environment.d/60-glolias.conf` for Linux
+  services started by the systemd user manager
+- `~/Library/LaunchAgents/com.github.impactaky.glolias-path.plist` for future
+  macOS launchd user/GUI processes
+
+Linux `environment.d` does not cover arbitrary SSH, TTY, or non-systemd shells.
+When no systemd user context is detected, or for shells other than the supported
+login shells, the plan prints a concrete manual step. On macOS the LaunchAgent
+uses `/bin/launchctl setenv` only when launchd starts it at a future login.
+
+Setup never invokes `sudo`, edits system-wide paths, changes the invoking
+process's `PATH`, runs `launchctl` during apply, or retroactively changes
+existing applications. Start a new login/session after applying or removing.
+Profile bytes outside the versioned managed block are preserved. Repeated shell
+evaluation, apply, and removal are idempotent.
+
+## Platforms
+
+Linux and macOS share the complete Alias management and dispatch behavior.
+Release Linux binaries are statically linked against musl. macOS binaries use
+the native executable-path API and require macOS 14 or later. Windows is not
+supported.
+
 ## Commands
 
 ```sh
@@ -115,6 +173,7 @@ glolias remove <name>
 glolias sync
 glolias list
 glolias path
+glolias setup [--remove] [--apply]
 glolias doctor
 ```
 
@@ -198,6 +257,9 @@ The command does not repair shims or change config or `PATH`. It reports only
 the environment of the shell that runs it. GUI-launched applications and IDEs
 may have a different `PATH`.
 
+When the Shims directory is missing from current `PATH`, `doctor` points to
+`glolias setup` as a preview command; it never reads or repairs setup files.
+
 ## Dispatch Behavior
 
 When invoked as `glolias`, the binary runs the management CLI.
@@ -221,6 +283,26 @@ Exit behavior for shim-side failures follows shell conventions:
 - Command present but not executable: `126`
 - Missing config, invalid config, or shim with no config entry: `127`
 
+## Release packaging
+
+On Linux, the local release entry point validates the requested version against
+`build.zig.zon`, cross-builds all four targets, and writes four archives plus
+`SHA256SUMS`:
+
+```sh
+scripts/package-release.sh 0.1.0 /tmp/glolias-release
+```
+
+Each `glolias-vX.Y.Z-<os>-<arch>.tar.gz` contains executable `glolias`,
+`README.md`, and `LICENSE`. The script refuses to overwrite an existing output
+and verifies the checksum file before succeeding.
+
+`.github/workflows/release.yml` runs only for strict `vX.Y.Z` tag patterns. It
+uses the same script, so a tag/build version mismatch fails before publication.
+Only after all four archives and checksums pass does the workflow create the
+tag's GitHub Release with generated notes. The workflow does not create or push
+tags.
+
 ## Design Notes
 
 Background and rationale are in:
@@ -231,11 +313,14 @@ Background and rationale are in:
 - [docs/adr/0003-toml-machine-managed-config.md](./docs/adr/0003-toml-machine-managed-config.md)
 - [docs/adr/0004-linux-first-no-environment-management.md](./docs/adr/0004-linux-first-no-environment-management.md)
 - [docs/adr/0005-transparent-execv-no-fork.md](./docs/adr/0005-transparent-execv-no-fork.md)
+- [docs/adr/0006-bats-e2e-suite.md](./docs/adr/0006-bats-e2e-suite.md)
+- [docs/adr/0007-zig-for-the-native-dispatcher.md](./docs/adr/0007-zig-for-the-native-dispatcher.md)
 - [docs/adr/0008-doctor-is-a-read-only-health-check.md](./docs/adr/0008-doctor-is-a-read-only-health-check.md)
+- [docs/adr/0009-preview-first-user-environment-setup.md](./docs/adr/0009-preview-first-user-environment-setup.md)
 
 Current scope:
 
-- Linux first
+- Linux x86-64/AArch64 and macOS 14+ Intel/Apple silicon
 - Machine-managed TOML config; comments and custom formatting are not preserved
-- Prefix-only aliases: no positional placeholders or interior `$@` expansion
-- `glolias` does not modify your shell, desktop, or IDE environment
+- Prefix-only Aliases: no positional placeholders or interior `$@` expansion
+- Persistent setup is explicit, preview-first, user-owned, and never changes the current session

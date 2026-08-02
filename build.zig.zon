@@ -14,8 +14,11 @@
         "build.zig.zon",
         "src",
         "tests",
+        "README.md",
+        "LICENSE",
+        "scripts",
+        ".github",
         "CONTEXT.md",
         "docs",
-        "plan.md",
     },
 }
