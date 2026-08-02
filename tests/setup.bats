@@ -67,6 +67,60 @@ enable_systemd_user_fact() {
   assert_stderr --partial "expected only [--remove] [--apply]"
 }
 
+@test "setup rejects empty or relative environment roots before preview or apply can mutate" {
+  safe_home="$HOME"
+  safe_config="$XDG_CONFIG_HOME"
+  safe_data="$XDG_DATA_HOME"
+  unsafe_cwd="$BATS_TEST_TMPDIR/unsafe-cwd"
+  mkdir -p "$unsafe_cwd"
+  printf '%s' 'profile bytes' >"$safe_home/.profile"
+  printf '%s' 'zprofile bytes' >"$safe_home/.zprofile"
+  profile_before="$(sha256sum "$safe_home/.profile")"
+  zprofile_before="$(sha256sum "$safe_home/.zprofile")"
+  path_before="$PATH"
+
+  cases=(
+    "|$safe_config|$safe_data|HOME"
+    "relative-home|$safe_config|$safe_data|HOME"
+    "$safe_home||$safe_data|XDG_CONFIG_HOME"
+    "$safe_home|relative-config|$safe_data|XDG_CONFIG_HOME"
+    "$safe_home|$safe_config||XDG_DATA_HOME"
+    "$safe_home|$safe_config|relative-data|XDG_DATA_HOME"
+  )
+
+  cd "$unsafe_cwd"
+  for mode in preview apply
+  do
+    setup_args=()
+    if [ "$mode" = apply ]
+    then
+      setup_args=(--apply)
+    fi
+
+    for test_case in "${cases[@]}"
+    do
+      IFS='|' read -r case_home case_config case_data expected_name <<<"$test_case"
+      run env \
+        HOME="$case_home" \
+        XDG_CONFIG_HOME="$case_config" \
+        XDG_DATA_HOME="$case_data" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        "$GLOLIAS_BIN" setup "${setup_args[@]}"
+
+      assert_failure 1
+      assert_output --partial "glolias setup: $expected_name must resolve to a non-empty absolute path"
+      assert_equal "$profile_before" "$(sha256sum "$safe_home/.profile")"
+      assert_equal "$zprofile_before" "$(sha256sum "$safe_home/.zprofile")"
+      assert_equal "$path_before" "$PATH"
+      assert [ ! -e "$safe_config/environment.d/60-glolias.conf" ]
+      assert [ ! -e "$safe_data/glolias/shims" ]
+      assert [ ! -e "$unsafe_cwd/relative-home" ]
+      assert [ ! -e "$unsafe_cwd/relative-config" ]
+      assert [ ! -e "$unsafe_cwd/relative-data" ]
+    done
+  done
+}
+
 @test "setup apply is atomic per file, idempotent, and PATH evaluation is duplicate-free" {
   enable_systemd_user_fact
   printf '%s' 'export KEEP=profile' >"$HOME/.profile"

@@ -38,6 +38,12 @@ pub const Facts = struct {
     systemd_user: bool,
 };
 
+pub const FactsError = error{
+    UnsafeHome,
+    UnsafeConfigHome,
+    UnsafeShimsDir,
+};
+
 pub const Target = struct {
     label: []const u8,
     path: []const u8,
@@ -127,6 +133,8 @@ pub const ApplyResult = union(enum) {
 };
 
 pub fn buildPlan(allocator: std.mem.Allocator, facts: Facts, mode: Mode) !Plan {
+    try validateFacts(facts);
+
     var plan = Plan{
         .mode = mode,
         .platform = facts.platform,
@@ -220,6 +228,12 @@ pub fn buildPlan(allocator: std.mem.Allocator, facts: Facts, mode: Mode) !Plan {
     }
 
     return plan;
+}
+
+pub fn validateFacts(facts: Facts) FactsError!void {
+    if (!isAbsoluteSetupPath(facts.home)) return error.UnsafeHome;
+    if (!isAbsoluteSetupPath(facts.config_home)) return error.UnsafeConfigHome;
+    if (!isAbsoluteSetupPath(facts.shims_dir)) return error.UnsafeShimsDir;
 }
 
 pub fn applyPlan(plan: *const Plan, allocator: std.mem.Allocator, options: ApplyOptions) ApplyResult {
@@ -718,6 +732,10 @@ fn validatePathComponent(path: []const u8) !void {
     }
 }
 
+fn isAbsoluteSetupPath(path: []const u8) bool {
+    return path.len != 0 and std.fs.path.isAbsolute(path);
+}
+
 fn shellSingleQuote(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -909,4 +927,34 @@ test "apply reports partial progress and an idempotent rerun converges" {
     var noop = try buildPlan(allocator, facts, .add);
     defer noop.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), noop.changeCount());
+}
+
+test "planning rejects empty or relative setup roots before filesystem inspection" {
+    const allocator = std.testing.allocator;
+    const safe = "/tmp/glolias-safe-root";
+    const base = Facts{
+        .platform = .linux,
+        .home = safe,
+        .config_home = safe,
+        .shims_dir = safe,
+        .systemd_user = false,
+    };
+
+    var facts = base;
+    facts.home = "";
+    try std.testing.expectError(error.UnsafeHome, buildPlan(allocator, facts, .add));
+    facts.home = "relative-home";
+    try std.testing.expectError(error.UnsafeHome, buildPlan(allocator, facts, .add));
+
+    facts = base;
+    facts.config_home = "";
+    try std.testing.expectError(error.UnsafeConfigHome, buildPlan(allocator, facts, .add));
+    facts.config_home = "relative-config";
+    try std.testing.expectError(error.UnsafeConfigHome, buildPlan(allocator, facts, .add));
+
+    facts = base;
+    facts.shims_dir = "";
+    try std.testing.expectError(error.UnsafeShimsDir, buildPlan(allocator, facts, .add));
+    facts.shims_dir = "relative-shims";
+    try std.testing.expectError(error.UnsafeShimsDir, buildPlan(allocator, facts, .add));
 }

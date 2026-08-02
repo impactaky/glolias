@@ -435,13 +435,18 @@ fn configureSetup(allocator: std.mem.Allocator, args: []const []const u8) !void 
     };
     const mode: setup_mod.Mode = if (res.args.remove != 0) .remove else .add;
     const apply = res.args.apply != 0;
-    var plan = try setup_mod.buildPlan(allocator, .{
+    var plan = setup_mod.buildPlan(allocator, .{
         .platform = platform,
         .home = home,
         .config_home = config_home,
         .shims_dir = shims_dir,
         .systemd_user = systemdUserAvailable(allocator),
-    }, mode);
+    }, mode) catch |err| switch (err) {
+        error.UnsafeHome => main.fail("glolias setup: HOME must resolve to a non-empty absolute path\n", .{}, 1),
+        error.UnsafeConfigHome => main.fail("glolias setup: XDG_CONFIG_HOME must resolve to a non-empty absolute path\n", .{}, 1),
+        error.UnsafeShimsDir => main.fail("glolias setup: XDG_DATA_HOME must resolve to a non-empty absolute path\n", .{}, 1),
+        else => return err,
+    };
     defer plan.deinit(allocator);
 
     try writeSetupPlan(allocator, &plan, apply);
