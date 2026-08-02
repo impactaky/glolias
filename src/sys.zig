@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const c = std.c;
 const dirent = c.dirent;
@@ -67,6 +68,65 @@ pub fn writeFileTruncate(allocator: std.mem.Allocator, path: []const u8, data: [
     if (fd < 0) return error.OpenFailed;
     defer _ = c.close(fd);
     try writeAll(fd, data);
+}
+
+pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    try ensureParentDir(allocator, path);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const existing_mode = blk: {
+        const info = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => break :blk null,
+            else => return error.StatFailed,
+        };
+        break :blk info.permissions.toMode();
+    };
+    var attempt: usize = 0;
+    while (attempt < 100) : (attempt += 1) {
+        const temp_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.glolias-tmp-{d}-{d}",
+            .{ path, c.getpid(), attempt },
+        );
+        defer allocator.free(temp_path);
+
+        const z_temp = try allocator.dupeZ(u8, temp_path);
+        defer allocator.free(z_temp);
+        const fd = c.open(z_temp.ptr, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+        }, @as(c.mode_t, 0o644));
+        if (fd < 0) {
+            switch (c.errno(-1)) {
+                .EXIST => continue,
+                else => return error.OpenFailed,
+            }
+        }
+
+        var fd_open = true;
+        var keep_temp = true;
+        defer {
+            if (fd_open) _ = c.close(fd);
+            if (keep_temp) _ = c.unlink(z_temp.ptr);
+        }
+        if (existing_mode) |mode| {
+            if (c.fchmod(fd, mode) != 0) return error.ChmodFailed;
+        }
+
+        try writeAll(fd, data);
+        if (c.fsync(fd) != 0) return error.SyncFailed;
+        const close_result = c.close(fd);
+        fd_open = false;
+        if (close_result != 0) return error.CloseFailed;
+
+        const z_path = try allocator.dupeZ(u8, path);
+        defer allocator.free(z_path);
+        if (c.rename(z_temp.ptr, z_path.ptr) != 0) return error.RenameFailed;
+        keep_temp = false;
+        return;
+    }
+    return error.TemporaryFileCollision;
 }
 
 pub fn mkdirp(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -142,28 +202,22 @@ pub const PathKind = enum {
 };
 
 pub fn pathKind(allocator: std.mem.Allocator, path: []const u8) !PathKind {
-    const z_path = try allocator.dupeZ(u8, path);
-    defer allocator.free(z_path);
+    _ = allocator;
 
-    var info = std.mem.zeroes(std.os.linux.Statx);
-    if (c.statx(
-        c.AT.FDCWD,
-        z_path.ptr,
-        c.AT.SYMLINK_NOFOLLOW,
-        .{ .TYPE = true },
-        &info,
-    ) != 0) {
-        return switch (c.errno(-1)) {
-            .NOENT, .NOTDIR => .missing,
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const info = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
+        return switch (err) {
+            error.FileNotFound, error.NotDir => .missing,
             else => error.StatFailed,
         };
-    }
+    };
 
-    const mode: c.mode_t = info.mode;
-    if (c.S.ISLNK(mode)) return .symlink;
-    if (c.S.ISDIR(mode)) return .directory;
-    if (c.S.ISREG(mode)) return .regular_file;
-    return .other;
+    return switch (info.kind) {
+        .sym_link => .symlink,
+        .directory => .directory,
+        .file => .regular_file,
+        else => .other,
+    };
 }
 
 pub fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -181,7 +235,16 @@ pub fn cwdAlloc(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn selfExePath(allocator: std.mem.Allocator) ![]const u8 {
-    return realpathAlloc(allocator, "/proc/self/exe");
+    return switch (builtin.os.tag) {
+        .linux => realpathAlloc(allocator, "/proc/self/exe"),
+        .macos => blk: {
+            var buffer: [std.posix.PATH_MAX + 1]u8 = undefined;
+            var size: u32 = buffer.len;
+            if (c._NSGetExecutablePath(&buffer, &size) != 0) return error.NameTooLong;
+            break :blk realpathAlloc(allocator, std.mem.sliceTo(&buffer, 0));
+        },
+        else => error.UnsupportedPlatform,
+    };
 }
 
 pub fn listSymlinks(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
@@ -200,7 +263,9 @@ pub fn listSymlinks(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
         const name_ptr: [*]const u8 = @ptrCast(&entry.name);
         const name = name_ptr[0..cStringLen(name_ptr)];
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        if (entry.type == c.DT.LNK) {
+        const entry_path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(entry_path);
+        if (try pathKind(allocator, entry_path) == .symlink) {
             try out.append(allocator, try allocator.dupe(u8, name));
         }
     }

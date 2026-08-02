@@ -19,12 +19,13 @@ load test_helper/common
     assert_output --partial "add [--force] <name> <cmd>..."
     assert_output --partial "list [--plain]"
     assert_output --partial "doctor"
+    assert_output --partial "setup [--remove] [--apply]"
     assert_output --partial "Run 'glolias <command> --help' for details on a command."
   done
 }
 
 @test "every command exposes help through all help forms" {
-  for cmd in add remove sync list path doctor
+  for cmd in add remove sync list path doctor setup
   do
     run --separate-stderr glolias "$cmd" --help
     assert_success
@@ -70,6 +71,16 @@ load test_helper/common
   assert_success
   refute_stderr
   assert_output --partial "--plain"
+}
+
+@test "setup help explains preview and explicit authorization" {
+  run --separate-stderr glolias setup --help
+  assert_success
+  refute_stderr
+  assert_output --partial "Preview is the default"
+  assert_output --partial "--apply is the sole"
+  assert_output --partial "--remove"
+  assert_output --partial "current PATH or OS session"
 }
 
 @test "parse-error help goes to stderr and fails" {

@@ -65,6 +65,7 @@ load test_helper/common
 
   assert_failure 1
   assert_output --partial "path: shims_dir is not on PATH"
+  assert_output --partial "glolias setup"
 }
 
 @test "doctor flags a real command shadowing the shim" {

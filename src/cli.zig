@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const clap = @import("clap");
 
@@ -6,6 +7,7 @@ const alias_name = @import("alias_name.zig");
 const config = @import("config.zig");
 const main = @import("main.zig");
 const paths = @import("paths.zig");
+const setup_mod = @import("setup.zig");
 const sys = @import("sys.zig");
 
 const Command = enum {
@@ -14,6 +16,7 @@ const Command = enum {
     sync,
     list,
     path,
+    setup,
     doctor,
     help,
 };
@@ -33,6 +36,7 @@ const commands = [_]CmdInfo{
     .{ .tag = .list, .name = "list", .usage_args = "[--plain]", .summary = "List configured aliases", .run = list },
     .{ .tag = .path, .name = "path", .usage_args = "", .summary = "Print the shims directory", .run = printPath },
     .{ .tag = .doctor, .name = "doctor", .usage_args = "", .summary = "Check setup; exit 1 on inconsistencies", .run = doctor },
+    .{ .tag = .setup, .name = "setup", .usage_args = "[--remove] [--apply]", .summary = "Preview or apply persistent user setup", .run = configureSetup },
 };
 
 const command_params = clap.parseParamsComptime(
@@ -74,6 +78,12 @@ const no_arg_params = clap.parseParamsComptime(
 const list_params = clap.parseParamsComptime(
     \\-h, --help   Display help for this command and exit.
     \\--plain      Tab-separated, header-less output for scripts.
+    \\
+);
+const setup_params = clap.parseParamsComptime(
+    \\-h, --help  Display help for this command and exit.
+    \\--remove    Plan removal of glolias-owned setup state.
+    \\--apply     Apply the complete preflighted plan.
     \\
 );
 
@@ -388,6 +398,171 @@ fn printPath(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try main.stdout(allocator, "{s}\n", .{cfg.shims_dir});
 }
 
+fn configureSetup(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var iter = clap.args.SliceIterator{ .args = args };
+    var diag = clap.Diagnostic{};
+    var res = clap.parseEx(clap.Help, &setup_params, clap.parsers.default, &iter, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
+    }) catch |err| failParseWithHelp("glolias setup", &setup_params, diag, err);
+    defer res.deinit();
+
+    if (res.args.help != 0) commandHelp(findCommand("setup").?, 0);
+    if (iter.index != args.len or res.args.remove > 1 or res.args.apply > 1) {
+        failUsageWithHelp(
+            "glolias setup: expected only [--remove] [--apply]\n",
+            "glolias setup",
+            &setup_params,
+        );
+    }
+
+    const home = sys.getenvOwned(allocator, "HOME") catch {
+        main.fail("glolias setup: HOME is required\n", .{}, 1);
+    };
+    defer allocator.free(home);
+    const config_home = sys.getenvOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => try std.fs.path.join(allocator, &.{ home, ".config" }),
+        else => return err,
+    };
+    defer allocator.free(config_home);
+    const shims_dir = try paths.defaultShimsDir(allocator);
+    defer allocator.free(shims_dir);
+
+    const platform: setup_mod.Platform = switch (builtin.os.tag) {
+        .linux => .linux,
+        .macos => .macos,
+        else => main.fail("glolias setup: unsupported platform\n", .{}, 1),
+    };
+    const mode: setup_mod.Mode = if (res.args.remove != 0) .remove else .add;
+    const apply = res.args.apply != 0;
+    var plan = try setup_mod.buildPlan(allocator, .{
+        .platform = platform,
+        .home = home,
+        .config_home = config_home,
+        .shims_dir = shims_dir,
+        .systemd_user = systemdUserAvailable(allocator),
+    }, mode);
+    defer plan.deinit(allocator);
+
+    try writeSetupPlan(allocator, &plan, apply);
+    if (plan.hasConflicts()) {
+        try main.stdout(allocator, "setup: conflict; no files changed\n", .{});
+        std.process.exit(1);
+    }
+    if (!apply) {
+        try main.stdout(
+            allocator,
+            "setup: preview complete; no files changed. Re-run with --apply to authorize this exact plan.\n",
+            .{},
+        );
+        return;
+    }
+
+    switch (setup_mod.applyPlan(&plan, allocator, .{})) {
+        .success => |count| {
+            if (count == 0) {
+                try main.stdout(allocator, "setup: apply complete; everything was already in the requested state\n", .{});
+            } else {
+                try main.stdout(allocator, "setup: apply complete; {d} atomic file action(s) applied\n", .{count});
+            }
+            try main.stdout(
+                allocator,
+                "setup: the current PATH and OS session were not changed; start a new login/session for persistent changes to take effect\n",
+                .{},
+            );
+        },
+        .preflight_changed => |index| {
+            try main.stdout(
+                allocator,
+                "setup: preflight conflict: {s} changed after planning; no files changed\n",
+                .{plan.targets.items[index].path},
+            );
+            std.process.exit(1);
+        },
+        .failed => |failure| {
+            try writeApplyFailure(allocator, &plan, failure);
+            std.process.exit(1);
+        },
+    }
+}
+
+fn systemdUserAvailable(allocator: std.mem.Allocator) bool {
+    const runtime_dir = sys.getenvOwned(allocator, "XDG_RUNTIME_DIR") catch return false;
+    defer allocator.free(runtime_dir);
+    const systemd_dir = std.fs.path.join(allocator, &.{ runtime_dir, "systemd" }) catch return false;
+    defer allocator.free(systemd_dir);
+    return sys.isDir(allocator, systemd_dir);
+}
+
+fn writeSetupPlan(allocator: std.mem.Allocator, plan: *const setup_mod.Plan, apply: bool) !void {
+    try main.stdout(
+        allocator,
+        "setup: {s} {s} plan ({s})\n",
+        .{
+            if (apply) "apply" else "read-only preview",
+            if (plan.mode == .add) "addition" else "removal",
+            if (plan.platform == .linux) "linux" else "macos",
+        },
+    );
+
+    for (plan.targets.items) |target| {
+        try main.stdout(allocator, "target: {s}\n", .{target.label});
+        try main.stdout(allocator, "path: {s}\n", .{target.path});
+        try main.stdout(allocator, "action: {s}\n", .{setup_mod.actionName(target.action)});
+        try main.stdout(allocator, "detail: {s}\n", .{target.detail});
+        if (target.display_content) |content| {
+            try main.stdout(allocator, "managed-content-begin\n{s}", .{content});
+            if (content.len == 0 or content[content.len - 1] != '\n') {
+                try main.stdout(allocator, "\n", .{});
+            }
+            try main.stdout(allocator, "managed-content-end\n", .{});
+        }
+    }
+
+    for (plan.manuals.items) |manual| {
+        try main.stdout(allocator, "manual: {s}\n", .{manual});
+    }
+    try main.stdout(
+        allocator,
+        "summary: {d} change(s), {s}\n",
+        .{ plan.changeCount(), if (plan.hasConflicts()) "conflicts present" else "preflight clean" },
+    );
+}
+
+fn writeApplyFailure(
+    allocator: std.mem.Allocator,
+    plan: *const setup_mod.Plan,
+    failure: setup_mod.ApplyFailure,
+) !void {
+    var mutation_ordinal: usize = 0;
+    for (plan.targets.items, 0..) |target, index| {
+        if (!setupMutation(target.action)) continue;
+        if (mutation_ordinal < failure.applied_changes) {
+            try main.stdout(allocator, "applied: {s}\n", .{target.path});
+        } else if (index == failure.target_index) {
+            try main.stdout(
+                allocator,
+                "failed: {s}: {s}\n",
+                .{ target.path, @errorName(failure.err) },
+            );
+        } else {
+            try main.stdout(allocator, "pending: {s}\n", .{target.path});
+        }
+        mutation_ordinal += 1;
+    }
+    try main.stdout(
+        allocator,
+        "setup: apply stopped after {d} applied action(s); rerun --apply after fixing the failure to converge\n",
+        .{failure.applied_changes},
+    );
+}
+
+fn setupMutation(action: setup_mod.Action) bool {
+    return switch (action) {
+        .create, .update, .remove => true,
+        .no_op, .conflict => false,
+    };
+}
 fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
     parseNoArgCommand(allocator, args, "doctor");
 
@@ -440,6 +615,7 @@ fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try main.stdout(allocator, "path: shims_dir present at position {d}\n", .{idx});
     } else {
         try main.stdout(allocator, "path: shims_dir is not on PATH\n", .{});
+        try main.stdout(allocator, "guidance: run 'glolias setup' to preview persistent PATH setup\n", .{});
         inconsistent = true;
     }
 
@@ -634,6 +810,10 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
             writer.writeAll(" ") catch {};
             clap.usage(&writer, clap.Help, &no_arg_params) catch {};
         },
+        .setup => {
+            writer.writeAll(" ") catch {};
+            clap.usage(&writer, clap.Help, &setup_params) catch {};
+        },
         .list => {
             writer.writeAll(" ") catch {};
             clap.usage(&writer, clap.Help, &list_params) catch {};
@@ -646,6 +826,7 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
         .remove => clap.help(&writer, clap.Help, &remove_params, helpOptions()) catch {},
         .sync, .path, .doctor => clap.help(&writer, clap.Help, &no_arg_params, helpOptions()) catch {},
         .list => clap.help(&writer, clap.Help, &list_params, helpOptions()) catch {},
+        .setup => clap.help(&writer, clap.Help, &setup_params, helpOptions()) catch {},
         .help => {},
     }
     switch (info.tag) {
@@ -656,6 +837,16 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
             \\
             \\Tokens after <name> are stored verbatim; leading-dash args are safe
             \\and not parsed by glolias.
+            \\
+        ) catch {},
+        .setup => writer.writeAll(
+            \\
+            \\Preview is the default and never changes files. --apply is the sole
+            \\authorization to apply the complete preflighted plan. --remove previews
+            \\only glolias-owned state; combine it with --apply to remove that state.
+            \\
+            \\Setup never changes the current PATH or OS session. Applied changes take
+            \\effect after a new login/session.
             \\
         ) catch {},
         .doctor => writer.writeAll(

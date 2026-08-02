@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("clap", clap.module("clap"));
 
     const exe = b.addExecutable(.{
+        .linkage = if (target.result.os.tag == .linux and target.result.abi == .musl) .static else null,
         .name = "glolias",
         .root_module = exe_mod,
     });

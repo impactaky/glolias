@@ -32,8 +32,10 @@ setup_file() {
 setup() {
   export XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/config"
   export XDG_DATA_HOME="$BATS_TEST_TMPDIR/data"
+  export HOME="$BATS_TEST_TMPDIR/home"
+  export XDG_RUNTIME_DIR="$BATS_TEST_TMPDIR/runtime"
   export TEST_BIN="$BATS_TEST_TMPDIR/bin"
-  mkdir -p "$TEST_BIN"
+  mkdir -p "$HOME" "$TEST_BIN" "$XDG_RUNTIME_DIR"
   export PATH="$(shims_dir):$TEST_BIN:$REAL_PATH"
   hash -r
 }
