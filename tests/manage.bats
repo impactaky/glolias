@@ -168,6 +168,18 @@ gitlog	echo long'
   refute_config_line 'bad = '
 }
 
+@test "remove saves the Alias deletion before reporting a Shim removal failure" {
+  glolias add blocked echo value
+  rm "$(shims_dir)/blocked"
+  mkdir "$(shims_dir)/blocked"
+
+  run --separate-stderr glolias remove blocked
+
+  assert_failure 1
+  refute_config_line 'blocked = '
+  assert [ -d "$(shims_dir)/blocked" ]
+}
+
 @test "removing an absent alias is an error" {
   glolias add known echo ok
 

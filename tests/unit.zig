@@ -6,6 +6,10 @@ test {
     std.testing.refAllDecls(glolias.config);
     std.testing.refAllDecls(glolias.config_toml);
     std.testing.refAllDecls(glolias.dispatch);
+    std.testing.refAllDecls(glolias.doctor);
+    std.testing.refAllDecls(glolias.real_command);
+    std.testing.refAllDecls(glolias.aliases);
+    std.testing.refAllDecls(glolias.setup);
     std.testing.refAllDecls(glolias.cli);
 }
 
@@ -14,7 +18,7 @@ test "every representative CLI-valid Alias name serializes" {
     const tokens = [_][]const u8{"echo"};
 
     for ([_][]const u8{ "a", "A0", "_local", "foo-bar" }) |name| {
-        try glolias.cli.validateName(name);
+        try glolias.alias_name.validate(name);
         const out = try glolias.config_toml.serializeConfig(allocator, 1, &.{
             .{ .name = name, .tokens = &tokens },
         });
@@ -35,7 +39,7 @@ test "CLI validation and TOML serialization reject the same Alias names" {
     };
 
     for (cases) |case| {
-        try std.testing.expectError(case.expected, glolias.cli.validateName(case.name));
+        try std.testing.expectError(case.expected, glolias.alias_name.validate(case.name));
         try std.testing.expectError(case.expected, glolias.config_toml.serializeConfig(allocator, 1, &.{
             .{ .name = case.name, .tokens = &tokens },
         }));

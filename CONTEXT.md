@@ -28,3 +28,6 @@ The genuine executable that a Shim ultimately reroutes to (e.g. the actual `/usr
 
 ### Setup Plan
 An inspectable description of additions, removals, conflicts, no-ops, and manual steps for user-owned persistent environment setup. A Setup Plan is separate from applying it: previewing is read-only, and explicit authorization is required before its changes occur.
+
+### Doctor
+A read-only diagnosis of config, the Shims directory, and the current shell's `PATH`. A Doctor reports every inspectable inconsistency without repairing state.

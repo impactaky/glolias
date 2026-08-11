@@ -55,6 +55,17 @@ enable_systemd_user_fact() {
   assert_equal "$path_before" "$PATH"
 }
 
+@test "setup apply does not mutate when the Setup Plan cannot be written" {
+  enable_systemd_user_fact
+
+  run --separate-stderr /bin/sh -c 'exec "$1" setup --apply 1>&-' sh "$GLOLIAS_BIN"
+
+  assert_failure 1
+  assert [ ! -e "$HOME/.profile" ]
+  assert [ ! -e "$HOME/.zprofile" ]
+  assert [ ! -e "$(environment_file)" ]
+}
+
 @test "setup rejects extra arguments and duplicate authorization flags with usage status" {
   run --separate-stderr glolias setup extra
   assert_equal "$status" 2

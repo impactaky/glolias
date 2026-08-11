@@ -1,12 +1,12 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const clap = @import("clap");
 
 const alias_name = @import("alias_name.zig");
+const aliases_mod = @import("aliases.zig");
 const config = @import("config.zig");
+const doctor_mod = @import("doctor.zig");
 const main = @import("main.zig");
-const paths = @import("paths.zig");
 const setup_mod = @import("setup.zig");
 const sys = @import("sys.zig");
 
@@ -217,33 +217,19 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (tokens.len == 0) {
         failUsageWithHelp("glolias: add requires <name> and <command>\n", "glolias add", &add_params);
     }
-    validateName(name) catch {
-        main.fail("glolias: invalid alias name '{s}': {s}\n", .{ name, alias_name.contract }, 2);
+    aliases_mod.add(allocator, name, tokens, force) catch |err| switch (err) {
+        error.EmptyName,
+        error.ReservedName,
+        error.InvalidInitialCharacter,
+        error.InvalidCharacter,
+        => main.fail("glolias: invalid alias name '{s}': {s}\n", .{ name, alias_name.contract }, 2),
+        error.AliasExistsWithDifferentTokens => main.fail(
+            "glolias: alias '{s}' exists with different tokens (use --force)\n",
+            .{name},
+            1,
+        ),
+        else => return err,
     };
-
-    var cfg = try config.loadOrInit(allocator);
-    defer cfg.deinit(allocator);
-
-    if (cfg.aliases.get(name)) |existing| {
-        if (!sameTokens(existing, tokens)) {
-            if (!force) {
-                main.fail("glolias: alias '{s}' exists with different tokens (use --force)\n", .{name}, 1);
-            }
-            if (cfg.aliases.fetchOrderedRemove(name)) |old| {
-                allocator.free(old.key);
-                freeTokens(allocator, old.value);
-            }
-        } else {
-            try config.save(allocator, &cfg);
-            try ensureSymlink(allocator, cfg.shims_dir, name);
-            return;
-        }
-    }
-
-    try putOwnedAlias(allocator, &cfg.aliases, name, tokens);
-
-    try config.save(allocator, &cfg);
-    try ensureSymlink(allocator, cfg.shims_dir, name);
 }
 
 fn remove(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -262,54 +248,19 @@ fn remove(allocator: std.mem.Allocator, args: []const []const u8) !void {
         failUsageWithHelp("glolias: remove requires exactly one alias name\n", "glolias remove", &remove_params);
     };
 
-    var cfg = config.load(allocator) catch |err| {
-        main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127);
-    };
-    defer cfg.deinit(allocator);
-
-    const old = cfg.aliases.fetchOrderedRemove(name) orelse {
-        main.fail("glolias: no alias '{s}'\n", .{name}, 1);
-    };
-    allocator.free(old.key);
-    freeTokens(allocator, old.value);
-
-    try config.save(allocator, &cfg);
-
-    const link_path = try std.fs.path.join(allocator, &.{ cfg.shims_dir, name });
-    defer allocator.free(link_path);
-    sys.unlinkPath(allocator, link_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    switch (try aliases_mod.remove(allocator, name)) {
+        .removed => {},
+        .not_found => main.fail("glolias: no alias '{s}'\n", .{name}, 1),
+        .load_failed => |err| main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127),
+    }
 }
 
 fn sync(allocator: std.mem.Allocator, args: []const []const u8) !void {
     parseNoArgCommand(allocator, args, "sync");
 
-    var cfg = config.load(allocator) catch |err| {
-        main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127);
-    };
-    defer cfg.deinit(allocator);
-
-    try sys.mkdirp(allocator, cfg.shims_dir);
-
-    var it = cfg.aliases.iterator();
-    while (it.next()) |entry| {
-        try ensureSymlink(allocator, cfg.shims_dir, entry.key_ptr.*);
-    }
-
-    const symlinks = try sys.listSymlinks(allocator, cfg.shims_dir);
-    defer {
-        for (symlinks) |entry_name| allocator.free(entry_name);
-        allocator.free(symlinks);
-    }
-
-    for (symlinks) |entry_name| {
-        if (!cfg.aliases.contains(entry_name)) {
-            const path = try std.fs.path.join(allocator, &.{ cfg.shims_dir, entry_name });
-            defer allocator.free(path);
-            try sys.unlinkPath(allocator, path);
-        }
+    switch (try aliases_mod.sync(allocator)) {
+        .synced => {},
+        .load_failed => |err| main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127),
     }
 }
 
@@ -416,359 +367,100 @@ fn configureSetup(allocator: std.mem.Allocator, args: []const []const u8) !void 
         );
     }
 
-    const home = sys.getenvOwned(allocator, "HOME") catch {
-        main.fail("glolias setup: HOME is required\n", .{}, 1);
-    };
-    defer allocator.free(home);
-    const config_home = sys.getenvOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => try std.fs.path.join(allocator, &.{ home, ".config" }),
-        else => return err,
-    };
-    defer allocator.free(config_home);
-    const shims_dir = try paths.defaultShimsDir(allocator);
-    defer allocator.free(shims_dir);
-
-    const platform: setup_mod.Platform = switch (builtin.os.tag) {
-        .linux => .linux,
-        .macos => .macos,
-        else => main.fail("glolias setup: unsupported platform\n", .{}, 1),
-    };
-    const mode: setup_mod.Mode = if (res.args.remove != 0) .remove else .add;
-    const apply = res.args.apply != 0;
-    var plan = setup_mod.buildPlan(allocator, .{
-        .platform = platform,
-        .home = home,
-        .config_home = config_home,
-        .shims_dir = shims_dir,
-        .systemd_user = systemdUserAvailable(allocator),
-    }, mode) catch |err| switch (err) {
+    const exit_code = setup_mod.execute(allocator, .{
+        .remove = res.args.remove != 0,
+        .apply = res.args.apply != 0,
+    }) catch |err| switch (err) {
+        error.MissingHome => main.fail("glolias setup: HOME is required\n", .{}, 1),
         error.UnsafeHome => main.fail("glolias setup: HOME must resolve to a non-empty absolute path\n", .{}, 1),
         error.UnsafeConfigHome => main.fail("glolias setup: XDG_CONFIG_HOME must resolve to a non-empty absolute path\n", .{}, 1),
         error.UnsafeShimsDir => main.fail("glolias setup: XDG_DATA_HOME must resolve to a non-empty absolute path\n", .{}, 1),
+        error.UnsupportedPlatform => main.fail("glolias setup: unsupported platform\n", .{}, 1),
         else => return err,
     };
-    defer plan.deinit(allocator);
-
-    try writeSetupPlan(allocator, &plan, apply);
-    if (plan.hasConflicts()) {
-        try main.stdout(allocator, "setup: conflict; no files changed\n", .{});
-        std.process.exit(1);
-    }
-    if (!apply) {
-        try main.stdout(
-            allocator,
-            "setup: preview complete; no files changed. Re-run with --apply to authorize this exact plan.\n",
-            .{},
-        );
-        return;
-    }
-
-    switch (setup_mod.applyPlan(&plan, allocator, .{})) {
-        .success => |count| {
-            if (count == 0) {
-                try main.stdout(allocator, "setup: apply complete; everything was already in the requested state\n", .{});
-            } else {
-                try main.stdout(allocator, "setup: apply complete; {d} atomic file action(s) applied\n", .{count});
-            }
-            try main.stdout(
-                allocator,
-                "setup: the current PATH and OS session were not changed; start a new login/session for persistent changes to take effect\n",
-                .{},
-            );
-        },
-        .preflight_changed => |index| {
-            try main.stdout(
-                allocator,
-                "setup: preflight conflict: {s} changed after planning; no files changed\n",
-                .{plan.targets.items[index].path},
-            );
-            std.process.exit(1);
-        },
-        .failed => |failure| {
-            try writeApplyFailure(allocator, &plan, failure);
-            std.process.exit(1);
-        },
+    if (exit_code != 0) {
+        std.process.exit(exit_code);
     }
 }
 
-fn systemdUserAvailable(allocator: std.mem.Allocator) bool {
-    const runtime_dir = sys.getenvOwned(allocator, "XDG_RUNTIME_DIR") catch return false;
-    defer allocator.free(runtime_dir);
-    const systemd_dir = std.fs.path.join(allocator, &.{ runtime_dir, "systemd" }) catch return false;
-    defer allocator.free(systemd_dir);
-    return sys.isDir(allocator, systemd_dir);
-}
-
-fn writeSetupPlan(allocator: std.mem.Allocator, plan: *const setup_mod.Plan, apply: bool) !void {
-    try main.stdout(
-        allocator,
-        "setup: {s} {s} plan ({s})\n",
-        .{
-            if (apply) "apply" else "read-only preview",
-            if (plan.mode == .add) "addition" else "removal",
-            if (plan.platform == .linux) "linux" else "macos",
-        },
-    );
-
-    for (plan.targets.items) |target| {
-        try main.stdout(allocator, "target: {s}\n", .{target.label});
-        try main.stdout(allocator, "path: {s}\n", .{target.path});
-        try main.stdout(allocator, "action: {s}\n", .{setup_mod.actionName(target.action)});
-        try main.stdout(allocator, "detail: {s}\n", .{target.detail});
-        if (target.display_content) |content| {
-            try main.stdout(allocator, "managed-content-begin\n{s}", .{content});
-            if (content.len == 0 or content[content.len - 1] != '\n') {
-                try main.stdout(allocator, "\n", .{});
-            }
-            try main.stdout(allocator, "managed-content-end\n", .{});
-        }
-    }
-
-    for (plan.manuals.items) |manual| {
-        try main.stdout(allocator, "manual: {s}\n", .{manual});
-    }
-    try main.stdout(
-        allocator,
-        "summary: {d} change(s), {s}\n",
-        .{ plan.changeCount(), if (plan.hasConflicts()) "conflicts present" else "preflight clean" },
-    );
-}
-
-fn writeApplyFailure(
-    allocator: std.mem.Allocator,
-    plan: *const setup_mod.Plan,
-    failure: setup_mod.ApplyFailure,
-) !void {
-    var mutation_ordinal: usize = 0;
-    for (plan.targets.items, 0..) |target, index| {
-        if (!setupMutation(target.action)) continue;
-        if (mutation_ordinal < failure.applied_changes) {
-            try main.stdout(allocator, "applied: {s}\n", .{target.path});
-        } else if (index == failure.target_index) {
-            try main.stdout(
-                allocator,
-                "failed: {s}: {s}\n",
-                .{ target.path, @errorName(failure.err) },
-            );
-        } else {
-            try main.stdout(allocator, "pending: {s}\n", .{target.path});
-        }
-        mutation_ordinal += 1;
-    }
-    try main.stdout(
-        allocator,
-        "setup: apply stopped after {d} applied action(s); rerun --apply after fixing the failure to converge\n",
-        .{failure.applied_changes},
-    );
-}
-
-fn setupMutation(action: setup_mod.Action) bool {
-    return switch (action) {
-        .create, .update, .remove => true,
-        .no_op, .conflict => false,
-    };
-}
 fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
     parseNoArgCommand(allocator, args, "doctor");
 
     try main.stdout(allocator, "doctor: current shell environment only; GUI IDE environments may differ\n", .{});
 
-    var inconsistent = false;
-    var shim_inconsistent = false;
+    const report = try doctor_mod.inspect(allocator);
+    defer report.deinit(allocator);
 
-    var cfg_opt: ?config.Config = config.load(allocator) catch |err| blk: {
-        try main.stdout(allocator, "config: error: {s}\n", .{@errorName(err)});
-        inconsistent = true;
-        break :blk null;
-    };
-    defer if (cfg_opt) |*cfg| cfg.deinit(allocator);
-    if (cfg_opt != null) try main.stdout(allocator, "config: ok\n", .{});
-
-    const shims_dir = try paths.defaultShimsDir(allocator);
-    defer allocator.free(shims_dir);
-
-    const shims_kind = sys.pathKind(allocator, shims_dir) catch |err| blk: {
-        try main.stdout(allocator, "shims_dir: unable to inspect: {s}: {s}\n", .{ shims_dir, @errorName(err) });
-        inconsistent = true;
-        shim_inconsistent = true;
-        break :blk null;
-    };
-    const shims_is_dir = sys.isDir(allocator, shims_dir);
-    if (shims_is_dir) {
-        try main.stdout(allocator, "shims_dir: ok: {s}\n", .{shims_dir});
-    } else if (shims_kind) |kind| switch (kind) {
-        .missing => {
-            try main.stdout(allocator, "shims_dir: missing: {s}\n", .{shims_dir});
-            inconsistent = true;
-            shim_inconsistent = true;
+    for (report.findings()) |finding| switch (finding) {
+        .config_ok => try main.stdout(allocator, "config: ok\n", .{}),
+        .config_error => |error_name| try main.stdout(allocator, "config: error: {s}\n", .{error_name}),
+        .shims_dir_ok => |path| try main.stdout(allocator, "shims_dir: ok: {s}\n", .{path}),
+        .shims_dir_missing => |path| try main.stdout(allocator, "shims_dir: missing: {s}\n", .{path}),
+        .shims_dir_not_directory => |finding_data| try main.stdout(
+            allocator,
+            "shims_dir: not a directory ({s}): {s}\n",
+            .{ pathKindName(finding_data.kind), finding_data.subject },
+        ),
+        .shims_dir_inspect_error => |finding_data| try main.stdout(
+            allocator,
+            "shims_dir: unable to inspect: {s}: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .path_present => |position| try main.stdout(
+            allocator,
+            "path: shims_dir present at position {d}\n",
+            .{position},
+        ),
+        .path_missing => {
+            try main.stdout(allocator, "path: shims_dir is not on PATH\n", .{});
+            try main.stdout(allocator, "guidance: run 'glolias setup' to preview persistent PATH setup\n", .{});
         },
-        else => {
-            try main.stdout(allocator, "shims_dir: not a directory ({s}): {s}\n", .{ pathKindName(kind), shims_dir });
-            inconsistent = true;
-            shim_inconsistent = true;
-        },
+        .shadowing => |finding_data| try main.stdout(
+            allocator,
+            "shadowing: {s} is shadowed by {s}/{s}\n",
+            .{ finding_data.subject, finding_data.detail, finding_data.subject },
+        ),
+        .binary_error => |error_name| try main.stdout(
+            allocator,
+            "binary: unable to resolve current glolias binary: {s}\n",
+            .{error_name},
+        ),
+        .shim_missing => |name| try main.stdout(allocator, "shim: {s}: missing\n", .{name}),
+        .shim_wrong_kind => |finding_data| try main.stdout(
+            allocator,
+            "shim: {s}: not a symlink ({s})\n",
+            .{ finding_data.subject, pathKindName(finding_data.kind) },
+        ),
+        .shim_inspect_error => |finding_data| try main.stdout(
+            allocator,
+            "shim: {s}: unable to inspect: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .shim_dangling => |name| try main.stdout(
+            allocator,
+            "shim: {s}: dangling or unresolvable symlink\n",
+            .{name},
+        ),
+        .shim_wrong_target => |finding_data| try main.stdout(
+            allocator,
+            "shim: {s}: points to a different glolias binary: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .orphan => |name| try main.stdout(allocator, "orphan: {s}\n", .{name}),
+        .no_orphans => try main.stdout(allocator, "orphans: none\n", .{}),
+        .orphans_skipped => try main.stdout(allocator, "orphans: skipped because config is unavailable\n", .{}),
+        .shims_inspect_error => try main.stdout(allocator, "shims: unable to inspect shims_dir\n", .{}),
     };
 
-    const path_value = sys.getenvOwned(allocator, "PATH") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => try allocator.dupe(u8, ""),
-        else => return err,
-    };
-    defer allocator.free(path_value);
-
-    const shims_index = findPathIndex(allocator, path_value, shims_dir);
-    if (shims_index) |idx| {
-        try main.stdout(allocator, "path: shims_dir present at position {d}\n", .{idx});
-    } else {
-        try main.stdout(allocator, "path: shims_dir is not on PATH\n", .{});
-        try main.stdout(allocator, "guidance: run 'glolias setup' to preview persistent PATH setup\n", .{});
-        inconsistent = true;
-    }
-
-    if (cfg_opt) |*cfg| {
-        var aliases = cfg.aliases.iterator();
-        while (aliases.next()) |entry| {
-            if (findFirstExecutableDir(allocator, path_value, entry.key_ptr.*)) |found| {
-                defer allocator.free(found.dir);
-                if (shims_index) |idx| {
-                    if (found.index < idx) {
-                        try main.stdout(allocator, "shadowing: {s} is shadowed by {s}/{s}\n", .{ entry.key_ptr.*, found.dir, entry.key_ptr.* });
-                        inconsistent = true;
-                    }
-                }
-            }
-        }
-    }
-
-    const current_binary = paths.selfExePath(allocator) catch |err| blk: {
-        try main.stdout(allocator, "binary: unable to resolve current glolias binary: {s}\n", .{@errorName(err)});
-        inconsistent = true;
-        break :blk null;
-    };
-    defer if (current_binary) |binary| allocator.free(binary);
-
-    if (cfg_opt) |*cfg| {
-        var aliases = cfg.aliases.iterator();
-        while (aliases.next()) |entry| {
-            const bad_shim = try diagnoseConfiguredShim(
-                allocator,
-                shims_dir,
-                entry.key_ptr.*,
-                current_binary,
-            );
-            if (bad_shim) {
-                inconsistent = true;
-                shim_inconsistent = true;
-            }
-        }
-    }
-
-    if (shims_is_dir) {
-        const symlinks = sys.listSymlinks(allocator, shims_dir) catch |err| switch (err) {
-            error.OpenDirFailed => blk: {
-                try main.stdout(allocator, "shims: unable to inspect shims_dir\n", .{});
-                inconsistent = true;
-                shim_inconsistent = true;
-                break :blk null;
-            },
-            else => return err,
-        };
-        defer if (symlinks) |entries| {
-            for (entries) |entry_name| allocator.free(entry_name);
-            allocator.free(entries);
-        };
-
-        if (symlinks) |entries| {
-            if (cfg_opt) |*cfg| {
-                var orphan_count: usize = 0;
-                for (entries) |entry_name| {
-                    if (!cfg.aliases.contains(entry_name)) {
-                        orphan_count += 1;
-                        try main.stdout(allocator, "orphan: {s}\n", .{entry_name});
-                    }
-                }
-                if (orphan_count == 0) {
-                    try main.stdout(allocator, "orphans: none\n", .{});
-                } else {
-                    inconsistent = true;
-                    shim_inconsistent = true;
-                }
-            } else {
-                for (entries) |entry_name| {
-                    const link_path = try std.fs.path.join(allocator, &.{ shims_dir, entry_name });
-                    defer allocator.free(link_path);
-                    if (try diagnoseSymlinkTarget(allocator, link_path, entry_name, current_binary)) {
-                        inconsistent = true;
-                        shim_inconsistent = true;
-                    }
-                }
-                try main.stdout(allocator, "orphans: skipped because config is unavailable\n", .{});
-            }
-        }
-    }
-
-    if (shim_inconsistent) {
+    if (report.needsShimRepair()) {
         try main.stdout(allocator, "repair: run 'glolias sync' to repair shims (remove blocking files or directories first)\n", .{});
     }
 
-    if (inconsistent) {
+    if (!report.healthy()) {
         try main.stdout(allocator, "doctor: inconsistencies found\n", .{});
         std.process.exit(1);
     }
     try main.stdout(allocator, "doctor: ok\n", .{});
-}
-
-fn diagnoseConfiguredShim(
-    allocator: std.mem.Allocator,
-    shims_dir: []const u8,
-    name: []const u8,
-    current_binary: ?[]const u8,
-) !bool {
-    const link_path = try std.fs.path.join(allocator, &.{ shims_dir, name });
-    defer allocator.free(link_path);
-
-    const kind = sys.pathKind(allocator, link_path) catch |err| {
-        try main.stdout(allocator, "shim: {s}: unable to inspect: {s}\n", .{ name, @errorName(err) });
-        return true;
-    };
-    return switch (kind) {
-        .missing => blk: {
-            try main.stdout(allocator, "shim: {s}: missing\n", .{name});
-            break :blk true;
-        },
-        .symlink => diagnoseSymlinkTarget(allocator, link_path, name, current_binary),
-        .directory => blk: {
-            try main.stdout(allocator, "shim: {s}: not a symlink (directory)\n", .{name});
-            break :blk true;
-        },
-        .regular_file => blk: {
-            try main.stdout(allocator, "shim: {s}: not a symlink (regular file)\n", .{name});
-            break :blk true;
-        },
-        .other => blk: {
-            try main.stdout(allocator, "shim: {s}: not a symlink (other file type)\n", .{name});
-            break :blk true;
-        },
-    };
-}
-
-fn diagnoseSymlinkTarget(
-    allocator: std.mem.Allocator,
-    link_path: []const u8,
-    name: []const u8,
-    current_binary: ?[]const u8,
-) !bool {
-    const resolved = sys.realpathAlloc(allocator, link_path) catch {
-        try main.stdout(allocator, "shim: {s}: dangling or unresolvable symlink\n", .{name});
-        return true;
-    };
-    defer allocator.free(resolved);
-
-    const binary = current_binary orelse return false;
-    if (!std.mem.eql(u8, resolved, binary)) {
-        try main.stdout(allocator, "shim: {s}: points to a different glolias binary: {s}\n", .{ name, resolved });
-        return true;
-    }
-    return false;
 }
 
 fn pathKindName(kind: sys.PathKind) []const u8 {
@@ -925,110 +617,4 @@ fn commandInfoFromContext(comptime context: []const u8) ?*const CmdInfo {
         if (std.mem.eql(u8, context, "glolias " ++ info.name)) return info;
     }
     return null;
-}
-
-pub fn validateName(name: []const u8) !void {
-    try alias_name.validate(name);
-}
-
-fn ensureSymlink(allocator: std.mem.Allocator, shims_dir: []const u8, name: []const u8) !void {
-    try sys.mkdirp(allocator, shims_dir);
-    const target = try paths.selfExePath(allocator);
-    defer allocator.free(target);
-
-    const link_path = try std.fs.path.join(allocator, &.{ shims_dir, name });
-    defer allocator.free(link_path);
-
-    sys.unlinkPath(allocator, link_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    try sys.symlinkPath(allocator, target, link_path);
-}
-
-fn copyTokens(allocator: std.mem.Allocator, tokens: []const []const u8) ![][]const u8 {
-    var out = try allocator.alloc([]const u8, tokens.len);
-    errdefer allocator.free(out);
-    for (tokens, 0..) |token, i| {
-        out[i] = try allocator.dupe(u8, token);
-    }
-    return out;
-}
-
-fn putOwnedAlias(
-    allocator: std.mem.Allocator,
-    aliases: *config.AliasMap,
-    name: []const u8,
-    tokens: []const []const u8,
-) !void {
-    const owned_name = try allocator.dupe(u8, name);
-    errdefer allocator.free(owned_name);
-    const owned_tokens = try copyTokens(allocator, tokens);
-    errdefer freeTokens(allocator, owned_tokens);
-
-    // A successful put transfers both allocations to Config.deinit.
-    try aliases.put(allocator, owned_name, owned_tokens);
-}
-
-fn freeTokens(allocator: std.mem.Allocator, tokens: [][]const u8) void {
-    for (tokens) |token| allocator.free(token);
-    allocator.free(tokens);
-}
-
-fn sameTokens(lhs: []const []const u8, rhs: []const []const u8) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |l, r| {
-        if (!std.mem.eql(u8, l, r)) return false;
-    }
-    return true;
-}
-
-const FoundExecutable = struct {
-    index: usize,
-    dir: []const u8,
-};
-
-fn findPathIndex(allocator: std.mem.Allocator, path_value: []const u8, needle: []const u8) ?usize {
-    var dirs = std.mem.splitScalar(u8, path_value, ':');
-    var index: usize = 0;
-    while (dirs.next()) |raw_dir| : (index += 1) {
-        const dir = if (raw_dir.len == 0) "." else raw_dir;
-        if (sameDir(allocator, dir, needle)) return index;
-    }
-    return null;
-}
-
-fn findFirstExecutableDir(allocator: std.mem.Allocator, path_value: []const u8, name: []const u8) ?FoundExecutable {
-    var dirs = std.mem.splitScalar(u8, path_value, ':');
-    var index: usize = 0;
-    while (dirs.next()) |raw_dir| : (index += 1) {
-        const dir = if (raw_dir.len == 0) "." else raw_dir;
-        const candidate = std.fs.path.join(allocator, &.{ dir, name }) catch return null;
-        defer allocator.free(candidate);
-        if (sys.isExecutableFile(allocator, candidate)) {
-            return .{
-                .index = index,
-                .dir = allocator.dupe(u8, dir) catch return null,
-            };
-        }
-    }
-    return null;
-}
-
-fn sameDir(allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8) bool {
-    const lhs_real = sys.realpathAlloc(allocator, lhs) catch return std.mem.eql(u8, lhs, rhs);
-    defer allocator.free(lhs_real);
-    const rhs_real = sys.realpathAlloc(allocator, rhs) catch return std.mem.eql(u8, lhs, rhs);
-    defer allocator.free(rhs_real);
-    return std.mem.eql(u8, lhs_real, rhs_real);
-}
-
-test "validateName applies the shared Alias name contract" {
-    for ([_][]const u8{ "a", "A0", "_local", "foo-bar" }) |name| {
-        try validateName(name);
-    }
-    try std.testing.expectError(error.EmptyName, validateName(""));
-    try std.testing.expectError(error.ReservedName, validateName("glolias"));
-    try std.testing.expectError(error.InvalidInitialCharacter, validateName("-x"));
-    try std.testing.expectError(error.InvalidCharacter, validateName("foo.bar"));
 }

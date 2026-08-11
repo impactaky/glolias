@@ -1,28 +1,30 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
+const paths = @import("paths.zig");
 const sys = @import("sys.zig");
 
-pub const start_marker = "# >>> glolias setup v1 >>>";
-pub const end_marker = "# <<< glolias setup v1 <<<";
-pub const environment_file_name = "60-glolias.conf";
-pub const launch_agent_name = "com.github.impactaky.glolias-path.plist";
+const start_marker = "# >>> glolias setup v1 >>>";
+const end_marker = "# <<< glolias setup v1 <<<";
+const environment_file_name = "60-glolias.conf";
+const launch_agent_name = "com.github.impactaky.glolias-path.plist";
 
-pub const Platform = enum {
+const Platform = enum {
     linux,
     macos,
 };
 
-pub const Mode = enum {
+const Mode = enum {
     add,
     remove,
 };
 
-pub const TargetKind = enum {
+const TargetKind = enum {
     profile,
     owned_file,
 };
 
-pub const Action = enum {
+const Action = enum {
     create,
     update,
     remove,
@@ -30,7 +32,7 @@ pub const Action = enum {
     conflict,
 };
 
-pub const Facts = struct {
+const Facts = struct {
     platform: Platform,
     home: []const u8,
     config_home: []const u8,
@@ -38,13 +40,13 @@ pub const Facts = struct {
     systemd_user: bool,
 };
 
-pub const FactsError = error{
+const FactsError = error{
     UnsafeHome,
     UnsafeConfigHome,
     UnsafeShimsDir,
 };
 
-pub const Target = struct {
+const Target = struct {
     label: []const u8,
     path: []const u8,
     kind: TargetKind,
@@ -66,13 +68,13 @@ pub const Target = struct {
     }
 };
 
-pub const Plan = struct {
+const Plan = struct {
     mode: Mode,
     platform: Platform,
     targets: std.ArrayList(Target) = .empty,
     manuals: std.ArrayList([]const u8) = .empty,
 
-    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+    fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         for (self.targets.items) |*target| target.deinit(allocator);
         self.targets.deinit(allocator);
         for (self.manuals.items) |manual| allocator.free(manual);
@@ -80,14 +82,14 @@ pub const Plan = struct {
         self.* = undefined;
     }
 
-    pub fn hasConflicts(self: *const Plan) bool {
+    fn hasConflicts(self: *const Plan) bool {
         for (self.targets.items) |target| {
             if (target.action == .conflict) return true;
         }
         return false;
     }
 
-    pub fn changeCount(self: *const Plan) usize {
+    fn changeCount(self: *const Plan) usize {
         var count: usize = 0;
         for (self.targets.items) |target| {
             if (isMutation(target.action)) count += 1;
@@ -116,23 +118,164 @@ const ProfileState = union(enum) {
     malformed,
 };
 
-pub const ApplyOptions = struct {
+const ApplyOptions = struct {
     fail_before_target_index: ?usize = null,
 };
 
-pub const ApplyFailure = struct {
+const ApplyFailure = struct {
     target_index: usize,
     applied_changes: usize,
     err: anyerror,
 };
 
-pub const ApplyResult = union(enum) {
+const ApplyResult = union(enum) {
     success: usize,
     preflight_changed: usize,
     failed: ApplyFailure,
 };
 
-pub fn buildPlan(allocator: std.mem.Allocator, facts: Facts, mode: Mode) !Plan {
+pub const ExecuteOptions = struct {
+    remove: bool = false,
+    apply: bool = false,
+};
+
+pub fn execute(allocator: std.mem.Allocator, options: ExecuteOptions) !u8 {
+    const home = sys.getenvOwned(allocator, "HOME") catch return error.MissingHome;
+    defer allocator.free(home);
+    const config_home = sys.getenvOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => try std.fs.path.join(allocator, &.{ home, ".config" }),
+        else => return err,
+    };
+    defer allocator.free(config_home);
+    const shims_dir = try paths.defaultShimsDir(allocator);
+    defer allocator.free(shims_dir);
+
+    const platform: Platform = switch (builtin.os.tag) {
+        .linux => .linux,
+        .macos => .macos,
+        else => return error.UnsupportedPlatform,
+    };
+    const mode: Mode = if (options.remove) .remove else .add;
+    var plan = try buildPlan(allocator, .{
+        .platform = platform,
+        .home = home,
+        .config_home = config_home,
+        .shims_dir = shims_dir,
+        .systemd_user = systemdUserAvailable(allocator),
+    }, mode);
+    defer plan.deinit(allocator);
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const writer = &output.writer;
+
+    try writePlan(writer, &plan, options.apply);
+    try flushOutput(&output);
+    if (plan.hasConflicts()) {
+        try writer.writeAll("setup: conflict; no files changed\n");
+        try flushOutput(&output);
+        return 1;
+    }
+    if (!options.apply) {
+        try writer.writeAll("setup: preview complete; no files changed. Re-run with --apply to authorize this exact plan.\n");
+        try flushOutput(&output);
+        return 0;
+    }
+
+    const exit_code: u8 = switch (applyPlan(&plan, allocator, .{})) {
+        .success => |count| blk: {
+            if (count == 0) {
+                try writer.writeAll("setup: apply complete; everything was already in the requested state\n");
+            } else {
+                try writer.print("setup: apply complete; {d} atomic file action(s) applied\n", .{count});
+            }
+            try writer.writeAll(
+                "setup: the current PATH and OS session were not changed; start a new login/session for persistent changes to take effect\n",
+            );
+            break :blk 0;
+        },
+        .preflight_changed => |index| blk: {
+            try writer.print(
+                "setup: preflight conflict: {s} changed after planning; no files changed\n",
+                .{plan.targets.items[index].path},
+            );
+            break :blk 1;
+        },
+        .failed => |failure| blk: {
+            try writeApplyFailure(writer, &plan, failure);
+            break :blk 1;
+        },
+    };
+    try flushOutput(&output);
+    return exit_code;
+}
+
+fn flushOutput(output: *std.Io.Writer.Allocating) !void {
+    try sys.writeAll(std.posix.STDOUT_FILENO, output.written());
+    output.clearRetainingCapacity();
+}
+
+fn systemdUserAvailable(allocator: std.mem.Allocator) bool {
+    const runtime_dir = sys.getenvOwned(allocator, "XDG_RUNTIME_DIR") catch return false;
+    defer allocator.free(runtime_dir);
+    const systemd_dir = std.fs.path.join(allocator, &.{ runtime_dir, "systemd" }) catch return false;
+    defer allocator.free(systemd_dir);
+    return sys.isDir(allocator, systemd_dir);
+}
+
+fn writePlan(writer: *std.Io.Writer, plan: *const Plan, apply: bool) !void {
+    try writer.print(
+        "setup: {s} {s} plan ({s})\n",
+        .{
+            if (apply) "apply" else "read-only preview",
+            if (plan.mode == .add) "addition" else "removal",
+            if (plan.platform == .linux) "linux" else "macos",
+        },
+    );
+
+    for (plan.targets.items) |target| {
+        try writer.print("target: {s}\n", .{target.label});
+        try writer.print("path: {s}\n", .{target.path});
+        try writer.print("action: {s}\n", .{actionName(target.action)});
+        try writer.print("detail: {s}\n", .{target.detail});
+        if (target.display_content) |content| {
+            try writer.print("managed-content-begin\n{s}", .{content});
+            if (content.len == 0 or content[content.len - 1] != '\n') {
+                try writer.writeByte('\n');
+            }
+            try writer.writeAll("managed-content-end\n");
+        }
+    }
+
+    for (plan.manuals.items) |manual| {
+        try writer.print("manual: {s}\n", .{manual});
+    }
+    try writer.print(
+        "summary: {d} change(s), {s}\n",
+        .{ plan.changeCount(), if (plan.hasConflicts()) "conflicts present" else "preflight clean" },
+    );
+}
+
+fn writeApplyFailure(writer: *std.Io.Writer, plan: *const Plan, failure: ApplyFailure) !void {
+    var mutation_ordinal: usize = 0;
+    for (plan.targets.items, 0..) |target, index| {
+        if (!isMutation(target.action)) continue;
+        if (mutation_ordinal < failure.applied_changes) {
+            try writer.print("applied: {s}\n", .{target.path});
+        } else if (index == failure.target_index) {
+            try writer.print("failed: {s}: {s}\n", .{ target.path, @errorName(failure.err) });
+        } else {
+            try writer.print("pending: {s}\n", .{target.path});
+        }
+        mutation_ordinal += 1;
+    }
+    try writer.print(
+        "setup: apply stopped after {d} applied action(s); rerun --apply after fixing the failure to converge\n",
+        .{failure.applied_changes},
+    );
+}
+
+fn buildPlan(allocator: std.mem.Allocator, facts: Facts, mode: Mode) !Plan {
     try validateFacts(facts);
 
     var plan = Plan{
@@ -230,13 +373,13 @@ pub fn buildPlan(allocator: std.mem.Allocator, facts: Facts, mode: Mode) !Plan {
     return plan;
 }
 
-pub fn validateFacts(facts: Facts) FactsError!void {
+fn validateFacts(facts: Facts) FactsError!void {
     if (!isAbsoluteSetupPath(facts.home)) return error.UnsafeHome;
     if (!isAbsoluteSetupPath(facts.config_home)) return error.UnsafeConfigHome;
     if (!isAbsoluteSetupPath(facts.shims_dir)) return error.UnsafeShimsDir;
 }
 
-pub fn applyPlan(plan: *const Plan, allocator: std.mem.Allocator, options: ApplyOptions) ApplyResult {
+fn applyPlan(plan: *const Plan, allocator: std.mem.Allocator, options: ApplyOptions) ApplyResult {
     if (plan.hasConflicts()) {
         for (plan.targets.items, 0..) |target, index| {
             if (target.action == .conflict) return .{ .preflight_changed = index };
@@ -275,7 +418,7 @@ pub fn applyPlan(plan: *const Plan, allocator: std.mem.Allocator, options: Apply
     return .{ .success = applied };
 }
 
-pub fn actionName(action: Action) []const u8 {
+fn actionName(action: Action) []const u8 {
     return switch (action) {
         .create => "create",
         .update => "update",
@@ -285,7 +428,7 @@ pub fn actionName(action: Action) []const u8 {
     };
 }
 
-pub fn renderProfileBlock(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
+fn renderProfileBlock(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
     try validatePathComponent(shims_dir);
     const quoted = try shellSingleQuote(allocator, shims_dir);
     defer allocator.free(quoted);
@@ -304,7 +447,7 @@ pub fn renderProfileBlock(allocator: std.mem.Allocator, shims_dir: []const u8) !
     , .{ start_marker, quoted, end_marker });
 }
 
-pub fn renderEnvironmentFile(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
+fn renderEnvironmentFile(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
     try validatePathComponent(shims_dir);
     if (!std.unicode.utf8ValidateSlice(shims_dir)) return error.UnsafePath;
     if (std.mem.indexOfScalar(u8, shims_dir, '$') != null) return error.UnsafePath;
@@ -315,7 +458,7 @@ pub fn renderEnvironmentFile(allocator: std.mem.Allocator, shims_dir: []const u8
     );
 }
 
-pub fn renderLaunchAgent(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
+fn renderLaunchAgent(allocator: std.mem.Allocator, shims_dir: []const u8) ![]const u8 {
     try validatePathComponent(shims_dir);
     if (!std.unicode.utf8ValidateSlice(shims_dir)) return error.UnsafePath;
 

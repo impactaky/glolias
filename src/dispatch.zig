@@ -2,6 +2,7 @@ const std = @import("std");
 
 const config = @import("config.zig");
 const main = @import("main.zig");
+const real_command = @import("real_command.zig");
 const sys = @import("sys.zig");
 
 const guard_env = "GLOLIAS_GUARD";
@@ -19,7 +20,7 @@ pub fn run(allocator: std.mem.Allocator, name: []const u8, rest_args: []const []
     defer allocator.free(guard_value);
 
     if (guardContains(guard_value, name)) {
-        const real = resolveReal(allocator, name, cfg.shims_dir) catch |err| {
+        const real = real_command.resolve(allocator, name, cfg.shims_dir) catch |err| {
             main.fail("glolias: {s}: command not found ({s})\n", .{ name, @errorName(err) }, 127);
         };
         defer allocator.free(real);
@@ -57,35 +58,6 @@ pub fn appendGuard(allocator: std.mem.Allocator, guard: []const u8, name: []cons
     if (guardContains(guard, name)) return allocator.dupe(u8, guard);
     if (guard.len == 0) return allocator.dupe(u8, name);
     return std.mem.concat(allocator, u8, &.{ guard, ":", name });
-}
-
-pub fn resolveReal(allocator: std.mem.Allocator, name: []const u8, shims_dir: []const u8) ![]const u8 {
-    const path_value = sys.getenvOwned(allocator, "PATH") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return error.CommandNotFound,
-        else => return err,
-    };
-    defer allocator.free(path_value);
-
-    var dirs = std.mem.splitScalar(u8, path_value, ':');
-    while (dirs.next()) |raw_dir| {
-        const dir = if (raw_dir.len == 0) "." else raw_dir;
-        if (sameDir(allocator, dir, shims_dir)) continue;
-
-        const candidate = try std.fs.path.join(allocator, &.{ dir, name });
-        if (sys.isExecutableFile(allocator, candidate)) {
-            return candidate;
-        }
-        allocator.free(candidate);
-    }
-    return error.CommandNotFound;
-}
-
-fn sameDir(allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8) bool {
-    const lhs_real = sys.realpathAlloc(allocator, lhs) catch return std.mem.eql(u8, lhs, rhs);
-    defer allocator.free(lhs_real);
-    const rhs_real = sys.realpathAlloc(allocator, rhs) catch return std.mem.eql(u8, lhs, rhs);
-    defer allocator.free(rhs_real);
-    return std.mem.eql(u8, lhs_real, rhs_real);
 }
 
 fn makeArgv(allocator: std.mem.Allocator, arg0: []const u8, rest: []const []const u8) ![][]const u8 {

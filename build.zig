@@ -46,8 +46,14 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const source_unit_tests = b.addTest(.{
+        .name = "source-unit",
+        .root_module = glolias_mod,
+    });
+    const run_source_unit_tests = b.addRunArtifact(source_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_source_unit_tests.step);
 
     const e2e = b.addSystemCommand(&.{ "tests/bats/bin/bats", "tests" });
     e2e.setEnvironmentVariable("GLOLIAS_BIN", b.getInstallPath(.bin, "glolias"));
