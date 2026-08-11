@@ -7,6 +7,7 @@ const aliases_mod = @import("aliases.zig");
 const config = @import("config.zig");
 const doctor_mod = @import("doctor.zig");
 const main = @import("main.zig");
+const paths = @import("paths.zig");
 const setup_mod = @import("setup.zig");
 const sys = @import("sys.zig");
 
@@ -217,7 +218,7 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (tokens.len == 0) {
         failUsageWithHelp("glolias: add requires <name> and <command>\n", "glolias add", &add_params);
     }
-    aliases_mod.add(allocator, name, tokens, force) catch |err| switch (err) {
+    const result = aliases_mod.add(allocator, name, tokens, force) catch |err| switch (err) {
         error.EmptyName,
         error.ReservedName,
         error.InvalidInitialCharacter,
@@ -230,6 +231,10 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
         ),
         else => return err,
     };
+    switch (result) {
+        .added => {},
+        .directory_failed => |failure| failDirectoryCreation(allocator, "add", failure),
+    }
 }
 
 fn remove(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -248,20 +253,94 @@ fn remove(allocator: std.mem.Allocator, args: []const []const u8) !void {
         failUsageWithHelp("glolias: remove requires exactly one alias name\n", "glolias remove", &remove_params);
     };
 
-    switch (try aliases_mod.remove(allocator, name)) {
+    const result = try aliases_mod.remove(allocator, name);
+    switch (result) {
         .removed => {},
         .not_found => main.fail("glolias: no alias '{s}'\n", .{name}, 1),
         .load_failed => |err| main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127),
+        .directory_failed => |failure| failDirectoryCreation(allocator, "remove", failure),
     }
 }
 
 fn sync(allocator: std.mem.Allocator, args: []const []const u8) !void {
     parseNoArgCommand(allocator, args, "sync");
 
-    switch (try aliases_mod.sync(allocator)) {
+    const result = try aliases_mod.sync(allocator);
+    switch (result) {
         .synced => {},
         .load_failed => |err| main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127),
+        .directory_failed => |failure| failDirectoryCreation(allocator, "sync", failure),
     }
+}
+
+fn failDirectoryCreation(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+    failure: aliases_mod.DirectoryFailure,
+) noreturn {
+    const reason = directoryErrorDescription(failure.err);
+    switch (failure.target) {
+        .config => {
+            const config_path = paths.configFilePath(allocator) catch {
+                main.fail(
+                    "glolias {s}: cannot create the config directory: {s}; check XDG_CONFIG_HOME or HOME\n",
+                    .{ command, reason },
+                    1,
+                );
+            };
+            const config_dir = std.fs.path.dirname(config_path) orelse config_path;
+            main.fail(
+                "glolias {s}: cannot create config directory '{s}': {s}\n",
+                .{ command, config_dir, reason },
+                1,
+            );
+        },
+        .shims => {
+            const shims_dir = paths.defaultShimsDir(allocator) catch {
+                main.fail(
+                    "glolias {s}: cannot create the shims directory: {s}; check XDG_DATA_HOME or HOME\n",
+                    .{ command, reason },
+                    1,
+                );
+            };
+            main.fail(
+                "glolias {s}: cannot create shims directory '{s}': {s}\n",
+                .{ command, shims_dir, reason },
+                1,
+            );
+        },
+    }
+}
+
+fn directoryErrorDescription(err: sys.CreateDirPathError) []const u8 {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.DiskQuota => "disk quota exceeded",
+        error.PathAlreadyExists, error.NotDir => "a parent path is not a directory",
+        error.SymLinkLoop => "too many symbolic links",
+        error.LinkQuotaExceeded => "link quota exceeded",
+        error.FileNotFound => "a parent path was not found",
+        error.SystemResources => "insufficient system resources",
+        error.NoSpaceLeft => "no space left on device",
+        error.ReadOnlyFileSystem => "read-only filesystem",
+        error.NoDevice => "device is unavailable",
+        error.NetworkNotFound => "network path was not found",
+        error.NameTooLong => "path is too long",
+        error.BadPathName => "invalid path",
+        error.Canceled => "operation canceled",
+        error.Unexpected => "unexpected filesystem error",
+        error.PipeBusy => "pipe is busy",
+        error.AntivirusInterference => "antivirus software blocked the operation",
+        error.ProcessFdQuotaExceeded => "process file descriptor limit reached",
+        error.SystemFdQuotaExceeded => "system file descriptor limit reached",
+        error.FileTooBig => "file is too large",
+        error.IsDir => "a path component has the wrong file type",
+        error.DeviceBusy => "device is busy",
+        error.FileLocksUnsupported => "file locking is unsupported",
+        error.FileBusy => "file is busy",
+        error.WouldBlock => "operation would block",
+        error.Streaming => "path refers to a non-file stream",
+    };
 }
 
 fn list(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -617,4 +696,11 @@ fn commandInfoFromContext(comptime context: []const u8) ?*const CmdInfo {
         if (std.mem.eql(u8, context, "glolias " ++ info.name)) return info;
     }
     return null;
+}
+
+test "directory errors have human-readable descriptions" {
+    try std.testing.expectEqualStrings("permission denied", directoryErrorDescription(error.AccessDenied));
+    try std.testing.expectEqualStrings("a parent path is not a directory", directoryErrorDescription(error.NotDir));
+    try std.testing.expectEqualStrings("read-only filesystem", directoryErrorDescription(error.ReadOnlyFileSystem));
+    try std.testing.expectEqualStrings("no space left on device", directoryErrorDescription(error.NoSpaceLeft));
 }

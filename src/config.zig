@@ -59,7 +59,7 @@ pub fn loadOrInit(allocator: std.mem.Allocator) !Config {
 }
 
 pub fn save(allocator: std.mem.Allocator, cfg: *const Config) !void {
-    try paths.ensureParentDir(allocator, cfg.config_path);
+    try paths.ensureParentDir(cfg.config_path);
 
     const keys = try sortedAliasKeys(allocator, cfg);
     defer allocator.free(keys);

@@ -59,7 +59,7 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, limit: usiz
 }
 
 pub fn writeFileTruncate(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    try ensureParentDir(allocator, path);
+    try ensureParentDir(path);
 
     const z_path = try allocator.dupeZ(u8, path);
     defer allocator.free(z_path);
@@ -71,7 +71,7 @@ pub fn writeFileTruncate(allocator: std.mem.Allocator, path: []const u8, data: [
 }
 
 pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    try ensureParentDir(allocator, path);
+    try ensureParentDir(path);
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const existing_mode = blk: {
@@ -129,34 +129,24 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []c
     return error.TemporaryFileCollision;
 }
 
-pub fn mkdirp(allocator: std.mem.Allocator, path: []const u8) !void {
+pub const CreateDirPathError = std.Io.Dir.CreateDirPathError;
+
+pub fn mkdirp(path: []const u8) CreateDirPathError!void {
     if (path.len == 0) return;
-    var partial = std.ArrayList(u8).empty;
-    defer partial.deinit(allocator);
-
-    if (path[0] == '/') try partial.append(allocator, '/');
-
-    var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |part| {
-        if (part.len == 0) continue;
-        if (partial.items.len > 0 and partial.items[partial.items.len - 1] != '/') {
-            try partial.append(allocator, '/');
-        }
-        try partial.appendSlice(allocator, part);
-        const z_path = try allocator.dupeZ(u8, partial.items);
-        defer allocator.free(z_path);
-        if (c.mkdir(z_path.ptr, 0o755) != 0) {
-            switch (c.errno(-1)) {
-                .EXIST => {},
-                else => return error.MkdirFailed,
-            }
-        }
-    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, path, .fromMode(0o755));
 }
 
-pub fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
+pub fn isCreateDirPathError(err: anyerror) bool {
+    inline for (@typeInfo(CreateDirPathError).error_set.?) |candidate| {
+        if (err == @field(CreateDirPathError, candidate.name)) return true;
+    }
+    return false;
+}
+
+pub fn ensureParentDir(path: []const u8) CreateDirPathError!void {
     if (std.fs.path.dirname(path)) |parent| {
-        try mkdirp(allocator, parent);
+        try mkdirp(parent);
     }
 }
 

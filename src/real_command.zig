@@ -110,8 +110,8 @@ test "lookup skips a directory-equivalent Shims entry and preserves PATH indexes
     defer allocator.free(linked_shims_dir);
     const real_dir = try std.fs.path.join(allocator, &.{ root, "real" });
     defer allocator.free(real_dir);
-    try sys.mkdirp(allocator, shims_dir);
-    try sys.mkdirp(allocator, real_dir);
+    try sys.mkdirp(shims_dir);
+    try sys.mkdirp(real_dir);
     try sys.symlinkPath(allocator, shims_dir, linked_shims_dir);
 
     const name = "glolias-real-command-test";

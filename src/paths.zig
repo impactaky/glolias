@@ -59,9 +59,9 @@ pub fn selfExePath(allocator: std.mem.Allocator) ![]const u8 {
     return sys.selfExePath(allocator);
 }
 
-pub fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
+pub fn ensureParentDir(path: []const u8) sys.CreateDirPathError!void {
     if (std.fs.path.dirname(path)) |parent| {
-        try sys.mkdirp(allocator, parent);
+        try sys.mkdirp(parent);
     }
 }
 

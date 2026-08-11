@@ -110,6 +110,50 @@ load test_helper/common
   assert [ ! -L "$(shims_dir)/blocked" ]
 }
 
+@test "add explains config directory creation failures" {
+  export XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/read-only-config"
+  mkdir "$XDG_CONFIG_HOME"
+  chmod 0555 "$XDG_CONFIG_HOME"
+
+  run --separate-stderr glolias add gh echo value
+  chmod 0755 "$XDG_CONFIG_HOME"
+
+  assert_failure 1
+  refute_output
+  assert_stderr --partial "glolias add: cannot create config directory '$XDG_CONFIG_HOME/glolias'"
+  assert_stderr --partial "permission denied"
+  refute_stderr --partial "MkdirFailed"
+}
+
+@test "add explains shims directory creation failures" {
+  export XDG_DATA_HOME="$BATS_TEST_TMPDIR/data-blocker"
+  touch "$XDG_DATA_HOME"
+
+  run --separate-stderr glolias add gh echo value
+
+  assert_failure 1
+  refute_output
+  assert_stderr --partial "glolias add: cannot create shims directory '$XDG_DATA_HOME/glolias/shims'"
+  assert_stderr --partial "a parent path is not a directory"
+  refute_stderr --partial "MkdirFailed"
+  assert_config_line 'gh = ["echo", "value"]'
+}
+
+@test "created directories remain 0755 with a permissive umask" {
+  original_umask="$(umask)"
+  umask 000
+  glolias add gh echo value
+  umask "$original_umask"
+
+  config_mode="$(stat -c '%a' "$XDG_CONFIG_HOME/glolias" 2>/dev/null || stat -f '%Lp' "$XDG_CONFIG_HOME/glolias")"
+  data_mode="$(stat -c '%a' "$XDG_DATA_HOME/glolias" 2>/dev/null || stat -f '%Lp' "$XDG_DATA_HOME/glolias")"
+  shims_mode="$(stat -c '%a' "$(shims_dir)" 2>/dev/null || stat -f '%Lp' "$(shims_dir)")"
+
+  assert_equal "$config_mode" 755
+  assert_equal "$data_mode" 755
+  assert_equal "$shims_mode" 755
+}
+
 @test "list shows aligned rows for people" {
   glolias add gf false
   glolias add gh echo WRAP

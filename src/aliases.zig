@@ -9,11 +9,25 @@ pub const RemoveResult = union(enum) {
     removed,
     not_found,
     load_failed: anyerror,
+    directory_failed: DirectoryFailure,
 };
 
 pub const SyncResult = union(enum) {
     synced,
     load_failed: anyerror,
+    directory_failed: DirectoryFailure,
+};
+
+pub const AddResult = union(enum) {
+    added,
+    directory_failed: DirectoryFailure,
+};
+
+pub const DirectoryTarget = enum { config, shims };
+
+pub const DirectoryFailure = struct {
+    target: DirectoryTarget,
+    err: sys.CreateDirPathError,
 };
 
 pub fn add(
@@ -21,7 +35,7 @@ pub fn add(
     name: []const u8,
     tokens: []const []const u8,
     force: bool,
-) !void {
+) !AddResult {
     try alias_name.validate(name);
     if (tokens.len == 0) return error.EmptyTokens;
 
@@ -36,15 +50,16 @@ pub fn add(
                 freeTokens(allocator, old.value);
             }
         } else {
-            try config.save(allocator, &cfg);
-            try ensureShim(allocator, cfg.shims_dir, name);
-            return;
+            if (try saveConfig(allocator, &cfg)) |failure| return .{ .directory_failed = failure };
+            if (try ensureShim(allocator, cfg.shims_dir, name)) |failure| return .{ .directory_failed = failure };
+            return .added;
         }
     }
 
     try putOwnedAlias(allocator, &cfg.aliases, name, tokens);
-    try config.save(allocator, &cfg);
-    try ensureShim(allocator, cfg.shims_dir, name);
+    if (try saveConfig(allocator, &cfg)) |failure| return .{ .directory_failed = failure };
+    if (try ensureShim(allocator, cfg.shims_dir, name)) |failure| return .{ .directory_failed = failure };
+    return .added;
 }
 
 pub fn remove(allocator: std.mem.Allocator, name: []const u8) !RemoveResult {
@@ -55,7 +70,7 @@ pub fn remove(allocator: std.mem.Allocator, name: []const u8) !RemoveResult {
     allocator.free(old.key);
     freeTokens(allocator, old.value);
 
-    try config.save(allocator, &cfg);
+    if (try saveConfig(allocator, &cfg)) |failure| return .{ .directory_failed = failure };
 
     const link_path = try std.fs.path.join(allocator, &.{ cfg.shims_dir, name });
     defer allocator.free(link_path);
@@ -70,11 +85,13 @@ pub fn sync(allocator: std.mem.Allocator) !SyncResult {
     var cfg = config.load(allocator) catch |err| return .{ .load_failed = err };
     defer cfg.deinit(allocator);
 
-    try sys.mkdirp(allocator, cfg.shims_dir);
+    if (try ensureShimsDir(cfg.shims_dir)) |failure| return .{ .directory_failed = failure };
 
     var it = cfg.aliases.iterator();
     while (it.next()) |entry| {
-        try ensureShim(allocator, cfg.shims_dir, entry.key_ptr.*);
+        if (try ensureShim(allocator, cfg.shims_dir, entry.key_ptr.*)) |failure| {
+            return .{ .directory_failed = failure };
+        }
     }
 
     const symlinks = try sys.listSymlinks(allocator, cfg.shims_dir);
@@ -93,8 +110,8 @@ pub fn sync(allocator: std.mem.Allocator) !SyncResult {
     return .synced;
 }
 
-fn ensureShim(allocator: std.mem.Allocator, shims_dir: []const u8, name: []const u8) !void {
-    try sys.mkdirp(allocator, shims_dir);
+fn ensureShim(allocator: std.mem.Allocator, shims_dir: []const u8, name: []const u8) !?DirectoryFailure {
+    if (try ensureShimsDir(shims_dir)) |failure| return failure;
     const target = try paths.selfExePath(allocator);
     defer allocator.free(target);
 
@@ -106,6 +123,23 @@ fn ensureShim(allocator: std.mem.Allocator, shims_dir: []const u8, name: []const
         else => return err,
     };
     try sys.symlinkPath(allocator, target, link_path);
+    return null;
+}
+
+fn saveConfig(allocator: std.mem.Allocator, cfg: *const config.Config) !?DirectoryFailure {
+    config.save(allocator, cfg) catch |err| {
+        if (sys.isCreateDirPathError(err)) {
+            const directory_err: sys.CreateDirPathError = @errorCast(err);
+            return .{ .target = .config, .err = directory_err };
+        }
+        return err;
+    };
+    return null;
+}
+
+fn ensureShimsDir(shims_dir: []const u8) !?DirectoryFailure {
+    sys.mkdirp(shims_dir) catch |err| return .{ .target = .shims, .err = err };
+    return null;
 }
 
 fn putOwnedAlias(
