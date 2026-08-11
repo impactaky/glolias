@@ -69,7 +69,7 @@ config schema. CLI argument parsing uses `zig-clap`, fetched by Zig from
 
 ## Install
 
-Release version 0.1.0 provides these archives:
+Release version 0.2.0 provides these archives:
 
 | Archive suffix | Runtime baseline |
 | --- | --- |
@@ -83,17 +83,17 @@ GitHub Release. Verify the selected archive before extracting it. For example:
 
 ```sh
 # Linux
-grep 'glolias-v0.1.0-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
+grep 'glolias-v0.2.0-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
 
 # macOS
-grep 'glolias-v0.1.0-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check
+grep 'glolias-v0.2.0-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check
 ```
 
 Extract it, place `glolias` at a stable user-selected location already on
 `PATH`, and then preview persistent setup:
 
 ```sh
-tar -xzf glolias-v0.1.0-linux-x86_64.tar.gz
+tar -xzf glolias-v0.2.0-linux-x86_64.tar.gz
 mkdir -p "$HOME/.local/bin"
 install -m 0755 glolias "$HOME/.local/bin/glolias"
 
@@ -290,7 +290,7 @@ On Linux, the local release entry point validates the requested version against
 `SHA256SUMS`:
 
 ```sh
-scripts/package-release.sh 0.1.0 /tmp/glolias-release
+scripts/package-release.sh 0.2.0 /tmp/glolias-release
 ```
 
 Each `glolias-vX.Y.Z-<os>-<arch>.tar.gz` contains executable `glolias`,
