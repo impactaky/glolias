@@ -1,33 +1,34 @@
 const std = @import("std");
-
 const cli = @import("cli.zig");
+const credential_runner = @import("credential_runner.zig");
 const dispatch = @import("dispatch.zig");
 const sys = @import("sys.zig");
 
-const Exit = error{Exit};
-
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     var args_list = std.ArrayList([]const u8).empty;
     defer args_list.deinit(allocator);
     while (iter.next()) |arg| try args_list.append(allocator, arg);
     const args = args_list.items;
 
+    if (credential_runner.isSelfRunner(allocator) catch false) {
+        if (args.len == 0) fail("glolias credential runner: refused: MissingArgv0\n", .{}, 127);
+        credential_runner.run(allocator, args) catch |err| {
+            fail("glolias credential runner: refused: {s}\n", .{@errorName(err)}, 127);
+        };
+    }
+
     const argv0 = if (args.len > 0) args[0] else "";
     const name = std.fs.path.basename(argv0);
-
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "/")) {
         stderr("glolias: cannot determine alias name (empty argv[0])\n", .{});
         std.process.exit(127);
     }
-
     if (std.mem.eql(u8, name, "glolias")) {
         try cli.run(allocator, args[1..]);
         return;
     }
-
     try dispatch.run(allocator, name, args[1..]);
 }
 

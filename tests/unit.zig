@@ -19,9 +19,9 @@ test "every representative CLI-valid Alias name serializes" {
 
     for ([_][]const u8{ "a", "A0", "_local", "foo-bar" }) |name| {
         try glolias.alias_name.validate(name);
-        const out = try glolias.config_toml.serializeConfig(allocator, 1, &.{
-            .{ .name = name, .tokens = &tokens },
-        });
+        const out = try glolias.config_toml.serializeConfig(allocator, &.{
+            .{ .name = name, .tokens = &tokens, .credential_names = &.{} },
+        }, &.{});
         defer allocator.free(out);
         try std.testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
@@ -40,9 +40,9 @@ test "CLI validation and TOML serialization reject the same Alias names" {
 
     for (cases) |case| {
         try std.testing.expectError(case.expected, glolias.alias_name.validate(case.name));
-        try std.testing.expectError(case.expected, glolias.config_toml.serializeConfig(allocator, 1, &.{
-            .{ .name = case.name, .tokens = &tokens },
-        }));
+        try std.testing.expectError(case.expected, glolias.config_toml.serializeConfig(allocator, &.{
+            .{ .name = case.name, .tokens = &tokens, .credential_names = &.{} },
+        }, &.{}));
     }
 }
 
@@ -66,10 +66,10 @@ test "internal config TOML parser serializes glolias schema" {
     );
     defer doc.deinit(allocator);
 
-    const out = try glolias.config_toml.serializeConfig(allocator, doc.version, &.{
-        .{ .name = doc.aliases[0].name, .tokens = doc.aliases[0].tokens },
-    });
+    const out = try glolias.config_toml.serializeConfig(allocator, &.{
+        .{ .name = doc.aliases[0].name, .tokens = doc.aliases[0].tokens, .credential_names = doc.aliases[0].credential_names },
+    }, &.{});
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "shims_dir") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "gh = [\"echo\", \"hi\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "gh.tokens = [\"echo\", \"hi\"]") != null);
 }

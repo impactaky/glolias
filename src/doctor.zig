@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const credential_runner = @import("credential_runner.zig");
 const paths = @import("paths.zig");
 const real_command = @import("real_command.zig");
 const sys = @import("sys.zig");
@@ -35,6 +36,18 @@ pub const Finding = union(enum) {
     no_orphans,
     orphans_skipped,
     shims_inspect_error,
+    credentials_dir_ok: []const u8,
+    credentials_dir_missing: []const u8,
+    credentials_dir_not_directory: SubjectKind,
+    credentials_dir_inspect_error: SubjectDetail,
+    credential_runner_ok: []const u8,
+    credential_runner_error: SubjectDetail,
+    credential_runner_stale: []const u8,
+    credential_duplicate_environment: SubjectDetail,
+    credential_orphan: []const u8,
+    credential_no_orphans,
+    credential_orphans_skipped,
+    credentials_inspect_error,
 
     fn deinit(self: *Finding, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -45,14 +58,23 @@ pub const Finding = union(enum) {
             .shim_missing,
             .shim_dangling,
             .orphan,
+            .credentials_dir_ok,
+            .credentials_dir_missing,
+            .credential_runner_ok,
+            .credential_runner_stale,
+            .credential_orphan,
             => |value| allocator.free(value),
             .shims_dir_not_directory,
             .shim_wrong_kind,
+            .credentials_dir_not_directory,
             => |value| allocator.free(value.subject),
             .shims_dir_inspect_error,
             .shadowing,
             .shim_inspect_error,
             .shim_wrong_target,
+            .credentials_dir_inspect_error,
+            .credential_runner_error,
+            .credential_duplicate_environment,
             => |value| {
                 allocator.free(value.subject);
                 allocator.free(value.detail);
@@ -63,6 +85,9 @@ pub const Finding = union(enum) {
             .no_orphans,
             .orphans_skipped,
             .shims_inspect_error,
+            .credential_no_orphans,
+            .credential_orphans_skipped,
+            .credentials_inspect_error,
             => {},
         }
         self.* = undefined;
@@ -100,6 +125,10 @@ pub const Report = opaque {
             .path_present,
             .no_orphans,
             .orphans_skipped,
+            .credentials_dir_ok,
+            .credential_runner_ok,
+            .credential_no_orphans,
+            .credential_orphans_skipped,
             => {},
             else => return false,
         };
@@ -119,6 +148,22 @@ pub const Report = opaque {
             .orphan,
             .shims_inspect_error,
             => return true,
+            else => {},
+        };
+        return false;
+    }
+
+    pub fn needsCredentialSync(self: *const Report) bool {
+        for (self.stateConst().entries.items) |entry| switch (entry) {
+            .credential_runner_stale => return true,
+            else => {},
+        };
+        return false;
+    }
+
+    pub fn needsCredentialReset(self: *const Report) bool {
+        for (self.stateConst().entries.items) |entry| switch (entry) {
+            .credential_runner_error => return true,
             else => {},
         };
         return false;
@@ -305,7 +350,86 @@ pub fn inspect(allocator: std.mem.Allocator) !*Report {
         }
     }
 
+    try inspectCredentials(allocator, report, if (cfg_opt) |*cfg| cfg else null);
+
     return report;
+}
+
+fn inspectCredentials(allocator: std.mem.Allocator, report: *Report, cfg: ?*const config.Config) !void {
+    const credentials_dir = try paths.defaultCredentialsDir(allocator);
+    defer allocator.free(credentials_dir);
+    const kind = sys.pathKind(allocator, credentials_dir) catch |err| {
+        try report.addDetail(allocator, .credentials_dir_inspect_error, credentials_dir, @errorName(err));
+        return;
+    };
+    switch (kind) {
+        .missing => {
+            if (cfg) |loaded| {
+                if (loaded.credentials.count() == 0) {
+                    try report.addSimple(allocator, .credential_no_orphans);
+                    return;
+                }
+                try report.addText(allocator, .credentials_dir_missing, credentials_dir);
+                const names = try config.sortedCredentialKeys(allocator, loaded);
+                defer allocator.free(names);
+                for (names) |name| try report.addDetail(allocator, .credential_runner_error, name, "RunnerMissing");
+            } else {
+                try report.addSimple(allocator, .credential_orphans_skipped);
+            }
+            return;
+        },
+        .directory => try report.addText(allocator, .credentials_dir_ok, credentials_dir),
+        else => {
+            try report.addKind(allocator, .credentials_dir_not_directory, credentials_dir, kind);
+            return;
+        },
+    }
+
+    if (cfg) |loaded| {
+        var aliases = loaded.aliases.iterator();
+        while (aliases.next()) |entry| {
+            config.validateAliasEnvironments(loaded, entry.value_ptr) catch |err| {
+                try report.addDetail(allocator, .credential_duplicate_environment, entry.key_ptr.*, @errorName(err));
+            };
+        }
+        const names = try config.sortedCredentialKeys(allocator, loaded);
+        defer allocator.free(names);
+        for (names) |name| {
+            const metadata = loaded.credentials.get(name).?;
+            const runner_path = try paths.credentialRunnerPath(allocator, credentials_dir, name);
+            defer allocator.free(runner_path);
+            var parsed = credential_runner.inspectExpected(allocator, runner_path, name, metadata.env_name) catch |err| {
+                try report.addDetail(allocator, .credential_runner_error, name, @errorName(err));
+                continue;
+            };
+            defer parsed.deinit(allocator);
+            switch (try credential_runner.statusAgainstCurrent(allocator, &parsed)) {
+                .valid => try report.addText(allocator, .credential_runner_ok, name),
+                .stale => try report.addText(allocator, .credential_runner_stale, name),
+            }
+        }
+    }
+
+    const entries = sys.listEntries(allocator, credentials_dir) catch {
+        try report.addSimple(allocator, .credentials_inspect_error);
+        return;
+    };
+    defer {
+        for (entries) |entry| allocator.free(entry);
+        allocator.free(entries);
+    }
+    if (cfg) |loaded| {
+        var orphan_count: usize = 0;
+        for (entries) |entry| {
+            if (!loaded.credentials.contains(entry)) {
+                orphan_count += 1;
+                try report.addText(allocator, .credential_orphan, entry);
+            }
+        }
+        if (orphan_count == 0) try report.addSimple(allocator, .credential_no_orphans);
+    } else {
+        try report.addSimple(allocator, .credential_orphans_skipped);
+    }
 }
 
 fn inspectConfiguredShim(

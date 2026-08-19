@@ -5,6 +5,9 @@ const clap = @import("clap");
 const alias_name = @import("alias_name.zig");
 const aliases_mod = @import("aliases.zig");
 const config = @import("config.zig");
+const credential_runner = @import("credential_runner.zig");
+const credential_tty = @import("credential_tty.zig");
+const credentials_mod = @import("credentials.zig");
 const doctor_mod = @import("doctor.zig");
 const main = @import("main.zig");
 const paths = @import("paths.zig");
@@ -13,6 +16,7 @@ const sys = @import("sys.zig");
 
 const Command = enum {
     add,
+    credential,
     remove,
     sync,
     list,
@@ -31,7 +35,8 @@ const CmdInfo = struct {
 };
 
 const commands = [_]CmdInfo{
-    .{ .tag = .add, .name = "add", .usage_args = "[--force] <name> <cmd>...", .summary = "Define an alias + create its shim", .run = add },
+    .{ .tag = .add, .name = "add", .usage_args = "[--force] [--credential <credential>]... <name> <cmd>...", .summary = "Define an alias + create its shim", .run = add },
+    .{ .tag = .credential, .name = "credential", .usage_args = "<set|attach|detach|list|remove> ...", .summary = "Manage named sealed credentials", .run = credential },
     .{ .tag = .remove, .name = "remove", .usage_args = "<name>", .summary = "Delete an alias and its shim", .run = remove },
     .{ .tag = .sync, .name = "sync", .usage_args = "", .summary = "Recreate/prune shims to match config", .run = sync },
     .{ .tag = .list, .name = "list", .usage_args = "[--plain]", .summary = "List configured aliases", .run = list },
@@ -53,12 +58,49 @@ const command_parsers = .{
 const add_params = clap.parseParamsComptime(
     \\-h, --help  Display help for this command and exit.
     \\--force    Replace an existing alias with different tokens.
+    \\--credential <credential>...  Bind an existing Credential (repeatable).
     \\<name>     Alias name (the shim to create).
     \\
 );
 
 const add_parsers = .{
+    .credential = clap.parsers.string,
     .name = clap.parsers.string,
+};
+
+const credential_set_params = clap.parseParamsComptime(
+    \\-h, --help  Display help for this command and exit.
+    \\--force     Allow changing an existing Credential's environment name.
+    \\<credential>  Credential name.
+    \\<ENV_NAME>    Portable environment-variable name.
+    \\
+);
+
+const credential_set_parsers = .{
+    .credential = clap.parsers.string,
+    .ENV_NAME = clap.parsers.string,
+};
+
+const credential_binding_params = clap.parseParamsComptime(
+    \\-h, --help  Display help for this command and exit.
+    \\<credential>  Existing Credential name.
+    \\<alias>...    One or more existing Alias names.
+    \\
+);
+
+const credential_binding_parsers = .{
+    .credential = clap.parsers.string,
+    .alias = clap.parsers.string,
+};
+
+const credential_remove_params = clap.parseParamsComptime(
+    \\-h, --help  Display help for this command and exit.
+    \\<credential>  Unused Credential name to remove.
+    \\
+);
+
+const credential_remove_parsers = .{
+    .credential = clap.parsers.string,
 };
 
 const remove_params = clap.parseParamsComptime(
@@ -218,7 +260,7 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (tokens.len == 0) {
         failUsageWithHelp("glolias: add requires <name> and <command>\n", "glolias add", &add_params);
     }
-    const result = aliases_mod.add(allocator, name, tokens, force) catch |err| switch (err) {
+    const result = aliases_mod.add(allocator, name, tokens, res.args.credential, force) catch |err| switch (err) {
         error.EmptyName,
         error.ReservedName,
         error.InvalidInitialCharacter,
@@ -229,11 +271,138 @@ fn add(allocator: std.mem.Allocator, args: []const []const u8) !void {
             .{name},
             1,
         ),
-        else => return err,
+        error.CredentialNotFound => main.fail("glolias: add references an unknown Credential\n", .{}, 1),
+        error.DuplicateCredentialBinding => main.fail("glolias: add repeats a Credential binding\n", .{}, 2),
+        error.ShimTargetBlocked => main.fail("glolias add: shim target is blocked by a non-symlink entry\n", .{}, 1),
+        error.UnsafeConfigTarget => main.fail("glolias add: config target is not a regular file\n", .{}, 1),
+        else => main.fail("glolias add: mutation failed: {s}\n", .{@errorName(err)}, 1),
     };
     switch (result) {
         .added => {},
         .directory_failed => |failure| failDirectoryCreation(allocator, "add", failure),
+    }
+}
+
+fn credential(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0 or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")) credentialHelp(0);
+    const subcommand = args[0];
+    const rest = args[1..];
+    if (std.mem.eql(u8, subcommand, "set")) return credentialSet(allocator, rest);
+    if (std.mem.eql(u8, subcommand, "attach")) return credentialBindings(allocator, rest, true);
+    if (std.mem.eql(u8, subcommand, "detach")) return credentialBindings(allocator, rest, false);
+    if (std.mem.eql(u8, subcommand, "list")) return credentialList(allocator, rest);
+    if (std.mem.eql(u8, subcommand, "remove")) return credentialRemove(allocator, rest);
+    main.fail("glolias credential: unknown command '{s}'\n", .{subcommand}, 2);
+}
+
+fn credentialSet(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var iter = clap.args.SliceIterator{ .args = args };
+    var diag = clap.Diagnostic{};
+    var res = clap.parseEx(clap.Help, &credential_set_params, credential_set_parsers, &iter, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
+    }) catch |err| failCredentialParse("set", &credential_set_params, diag, err);
+    defer res.deinit();
+    if (res.args.help != 0) credentialSubcommandHelp("set", &credential_set_params, 0);
+    if (iter.index != args.len or res.positionals[0] == null or res.positionals[1] == null) {
+        failCredentialUsage("set", &credential_set_params);
+    }
+    const name = res.positionals[0].?;
+    const environment = res.positionals[1].?;
+    credentials_mod.preflightSet(allocator, name, environment, res.args.force != 0) catch |err| failCredentialMutation("set", name, err);
+    const secret = credential_tty.readSecret(allocator) catch |err| failCredentialMutation("set", name, err);
+    defer {
+        std.crypto.secureZero(u8, secret);
+        allocator.free(secret);
+    }
+    credentials_mod.set(allocator, name, environment, secret, res.args.force != 0) catch |err| failCredentialMutation("set", name, err);
+    try main.stdout(allocator, "credential: {s}: sealed runner installed\n", .{name});
+}
+
+fn credentialBindings(allocator: std.mem.Allocator, args: []const []const u8, adding: bool) !void {
+    const verb = if (adding) "attach" else "detach";
+    var iter = clap.args.SliceIterator{ .args = args };
+    var diag = clap.Diagnostic{};
+    var res = clap.parseEx(clap.Help, &credential_binding_params, credential_binding_parsers, &iter, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
+    }) catch |err| failCredentialParseDynamic(verb, &credential_binding_params, diag, err);
+    defer res.deinit();
+    if (res.args.help != 0) credentialSubcommandHelpDynamic(verb, &credential_binding_params, 0);
+    const name = res.positionals[0] orelse failCredentialUsageDynamic(verb, &credential_binding_params);
+    if (res.positionals[1].len == 0 or iter.index != args.len) failCredentialUsageDynamic(verb, &credential_binding_params);
+    if (adding)
+        credentials_mod.attach(allocator, name, res.positionals[1]) catch |err| failCredentialMutation(verb, name, err)
+    else
+        credentials_mod.detach(allocator, name, res.positionals[1]) catch |err| failCredentialMutation(verb, name, err);
+}
+
+fn credentialList(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))) {
+        credentialSubcommandHelp("list", &no_arg_params, 0);
+    }
+    if (args.len != 0) failCredentialUsage("list", &no_arg_params);
+    var cfg = config.loadOrInit(allocator) catch |err| main.fail("glolias credential list: unable to load config: {s}\n", .{@errorName(err)}, 1);
+    defer cfg.deinit(allocator);
+    const names = try config.sortedCredentialKeys(allocator, &cfg);
+    defer allocator.free(names);
+    try main.stdout(allocator, "CREDENTIAL\tENVIRONMENT\tALIASES\tSTATUS\n", .{});
+    for (names) |name| {
+        const metadata = cfg.credentials.get(name).?;
+        const bound = try credentials_mod.boundAliases(allocator, &cfg, name);
+        defer allocator.free(bound);
+        const runner_path = try paths.credentialRunnerPath(allocator, cfg.credentials_dir, name);
+        defer allocator.free(runner_path);
+        var parsed = credential_runner.inspectExpected(allocator, runner_path, name, metadata.env_name) catch |err| {
+            try main.stdout(allocator, "{s}\t{s}\t", .{ name, metadata.env_name });
+            try writeJoined(allocator, bound, ",");
+            try main.stdout(allocator, "\t{s}\n", .{@errorName(err)});
+            continue;
+        };
+        defer parsed.deinit(allocator);
+        const status = credential_runner.statusAgainstCurrent(allocator, &parsed) catch .stale;
+        try main.stdout(allocator, "{s}\t{s}\t", .{ name, metadata.env_name });
+        try writeJoined(allocator, bound, ",");
+        try main.stdout(allocator, "\t{s}\n", .{@tagName(status)});
+    }
+}
+
+fn credentialRemove(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var iter = clap.args.SliceIterator{ .args = args };
+    var diag = clap.Diagnostic{};
+    var res = clap.parseEx(clap.Help, &credential_remove_params, credential_remove_parsers, &iter, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
+    }) catch |err| failCredentialParse("remove", &credential_remove_params, diag, err);
+    defer res.deinit();
+    if (res.args.help != 0) credentialSubcommandHelp("remove", &credential_remove_params, 0);
+    if (iter.index != args.len or res.positionals[0] == null) failCredentialUsage("remove", &credential_remove_params);
+    const name = res.positionals[0].?;
+    credentials_mod.remove(allocator, name) catch |err| failCredentialMutation("remove", name, err);
+    try main.stdout(allocator, "credential: {s}: removed; recovery requires 'credential set' and entering the secret again\n", .{name});
+}
+
+fn failCredentialMutation(verb: []const u8, name: []const u8, err: anyerror) noreturn {
+    const guidance: []const u8 = switch (err) {
+        error.CredentialEnvironmentConflict => "environment name differs; use --force to change it",
+        error.CredentialNotFound => "Credential does not exist",
+        error.CredentialInUse => "Credential is still attached; detach it first",
+        error.AliasNotFound => "one or more Aliases do not exist",
+        error.TtyUnavailable => "/dev/tty is unavailable; run from an interactive SSH TTY",
+        error.EmptySecret => "empty secrets are refused",
+        error.SecretTooLong => "secret exceeds the maximum length",
+        error.SecretContainsNul => "secret contains NUL",
+        error.RunnerMissingOrUnsafe, error.RunnerMissing => "runner is missing or unsafe; enter the secret again with credential set",
+        error.UnsafeCredentialsDirectory => "credentials directory is not a real directory",
+        else => @errorName(err),
+    };
+    main.fail("glolias credential {s}: {s}: {s}\n", .{ verb, name, guidance }, 1);
+}
+
+fn writeJoined(allocator: std.mem.Allocator, values: []const []const u8, separator: []const u8) !void {
+    for (values, 0..) |value, i| {
+        if (i != 0) try main.stdout(allocator, "{s}", .{separator});
+        try main.stdout(allocator, "{s}", .{value});
     }
 }
 
@@ -253,7 +422,11 @@ fn remove(allocator: std.mem.Allocator, args: []const []const u8) !void {
         failUsageWithHelp("glolias: remove requires exactly one alias name\n", "glolias remove", &remove_params);
     };
 
-    const result = try aliases_mod.remove(allocator, name);
+    const result = aliases_mod.remove(allocator, name) catch |err| switch (err) {
+        error.ShimTargetBlocked => main.fail("glolias remove: shim target is blocked by a non-symlink entry\n", .{}, 1),
+        error.UnsafeConfigTarget => main.fail("glolias remove: config target is not a regular file\n", .{}, 1),
+        else => main.fail("glolias remove: mutation failed: {s}\n", .{@errorName(err)}, 1),
+    };
     switch (result) {
         .removed => {},
         .not_found => main.fail("glolias: no alias '{s}'\n", .{name}, 1),
@@ -270,6 +443,11 @@ fn sync(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .synced => {},
         .load_failed => |err| main.fail("glolias: unable to load config: {s}\n", .{@errorName(err)}, 127),
         .directory_failed => |failure| failDirectoryCreation(allocator, "sync", failure),
+        .credential_failed => |failure| main.fail(
+            "glolias sync: Credential '{s}' runner cannot be refreshed: {s}; run 'glolias credential set {s} <ENV_NAME>'\n",
+            .{ failure.name, @errorName(failure.err), failure.name },
+            1,
+        ),
     }
 }
 
@@ -309,6 +487,11 @@ fn failDirectoryCreation(
                 1,
             );
         },
+        .credentials => main.fail(
+            "glolias {s}: cannot create credentials directory: {s}\n",
+            .{ command, reason },
+            1,
+        ),
     }
 }
 
@@ -368,15 +551,15 @@ fn list(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const alias_width = listAliasWidth(keys);
         try writeListPrettyHeader(allocator, alias_width);
         for (keys) |key| {
-            const tokens = cfg.aliases.get(key).?;
-            try writeListPrettyRow(allocator, alias_width, key, tokens);
+            const alias = cfg.aliases.get(key).?;
+            try writeListPrettyRow(allocator, alias_width, key, alias.tokens);
         }
         return;
     }
 
     for (keys) |key| {
-        const tokens = cfg.aliases.get(key).?;
-        try writeListPlainRow(allocator, key, tokens);
+        const alias = cfg.aliases.get(key).?;
+        try writeListPlainRow(allocator, key, alias.tokens);
     }
 }
 
@@ -529,10 +712,44 @@ fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .no_orphans => try main.stdout(allocator, "orphans: none\n", .{}),
         .orphans_skipped => try main.stdout(allocator, "orphans: skipped because config is unavailable\n", .{}),
         .shims_inspect_error => try main.stdout(allocator, "shims: unable to inspect shims_dir\n", .{}),
+        .credentials_dir_ok => |path| try main.stdout(allocator, "credentials_dir: ok: {s}\n", .{path}),
+        .credentials_dir_missing => |path| try main.stdout(allocator, "credentials_dir: missing: {s}\n", .{path}),
+        .credentials_dir_not_directory => |finding_data| try main.stdout(
+            allocator,
+            "credentials_dir: not a directory ({s}): {s}\n",
+            .{ pathKindName(finding_data.kind), finding_data.subject },
+        ),
+        .credentials_dir_inspect_error => |finding_data| try main.stdout(
+            allocator,
+            "credentials_dir: unable to inspect: {s}: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .credential_runner_ok => |name| try main.stdout(allocator, "credential: {s}: runner ok\n", .{name}),
+        .credential_runner_error => |finding_data| try main.stdout(
+            allocator,
+            "credential: {s}: runner invalid: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .credential_runner_stale => |name| try main.stdout(allocator, "credential: {s}: runner stale\n", .{name}),
+        .credential_duplicate_environment => |finding_data| try main.stdout(
+            allocator,
+            "credential: alias {s}: duplicate environment providers: {s}\n",
+            .{ finding_data.subject, finding_data.detail },
+        ),
+        .credential_orphan => |name| try main.stdout(allocator, "credential orphan: {s}\n", .{name}),
+        .credential_no_orphans => try main.stdout(allocator, "credential orphans: none\n", .{}),
+        .credential_orphans_skipped => try main.stdout(allocator, "credential orphans: skipped because config is unavailable\n", .{}),
+        .credentials_inspect_error => try main.stdout(allocator, "credentials: unable to inspect credentials_dir\n", .{}),
     };
 
     if (report.needsShimRepair()) {
         try main.stdout(allocator, "repair: run 'glolias sync' to repair shims (remove blocking files or directories first)\n", .{});
+    }
+    if (report.needsCredentialSync()) {
+        try main.stdout(allocator, "repair: run 'glolias sync' to refresh stale Credential Runners\n", .{});
+    }
+    if (report.needsCredentialReset()) {
+        try main.stdout(allocator, "repair: run 'glolias credential set <credential> <ENV_NAME>' to recreate missing or invalid runners\n", .{});
     }
 
     if (!report.healthy()) {
@@ -578,6 +795,7 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
             clap.usage(&writer, clap.Help, &add_params) catch {};
             writer.writeAll(" <cmd>...") catch {};
         },
+        .credential => writer.writeAll(" <set|attach|detach|list|remove> ...") catch {},
         .remove => {
             writer.writeAll(" ") catch {};
             clap.usage(&writer, clap.Help, &remove_params) catch {};
@@ -599,6 +817,7 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
     writer.writeAll("\n\n") catch {};
     switch (info.tag) {
         .add => clap.help(&writer, clap.Help, &add_params, helpOptions()) catch {},
+        .credential => {},
         .remove => clap.help(&writer, clap.Help, &remove_params, helpOptions()) catch {},
         .sync, .path, .doctor => clap.help(&writer, clap.Help, &no_arg_params, helpOptions()) catch {},
         .list => clap.help(&writer, clap.Help, &list_params, helpOptions()) catch {},
@@ -635,11 +854,73 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
             \\environments may differ.
             \\
         ) catch {},
+        .credential => writer.writeAll(
+            \\Credential values are accepted only from /dev/tty with echo disabled.
+            \\There is no get, show-secret, or export operation. Run
+            \\'glolias credential --help' for lifecycle commands.
+            \\
+        ) catch {},
         else => {},
     }
 
     sys.writeAll(fd, writer.buffered()) catch {};
     std.process.exit(code);
+}
+
+fn credentialHelp(code: u8) noreturn {
+    const fd: std.c.fd_t = if (code == 0) std.posix.STDOUT_FILENO else std.posix.STDERR_FILENO;
+    const message =
+        \\glolias credential — manage named sealed credentials
+        \\
+        \\usage:
+        \\  glolias credential set [--force] <credential> <ENV_NAME>
+        \\  glolias credential attach <credential> <alias>...
+        \\  glolias credential detach <credential> <alias>...
+        \\  glolias credential list
+        \\  glolias credential remove <credential>
+        \\
+        \\Secrets are entered only through /dev/tty with echo disabled. Credential list
+        \\shows public metadata and runner health only; glolias has no reveal or export API.
+        \\
+    ;
+    sys.writeAll(fd, message) catch {};
+    std.process.exit(code);
+}
+
+fn credentialSubcommandHelp(comptime verb: []const u8, comptime params: []const clap.Param(clap.Help), code: u8) noreturn {
+    credentialSubcommandHelpDynamic(verb, params, code);
+}
+
+fn credentialSubcommandHelpDynamic(verb: []const u8, comptime params: []const clap.Param(clap.Help), code: u8) noreturn {
+    const fd: std.c.fd_t = if (code == 0) std.posix.STDOUT_FILENO else std.posix.STDERR_FILENO;
+    var buf: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    writer.print("usage: glolias credential {s} ", .{verb}) catch {};
+    clap.usage(&writer, clap.Help, params) catch {};
+    writer.writeAll("\n\n") catch {};
+    clap.help(&writer, clap.Help, params, helpOptions()) catch {};
+    sys.writeAll(fd, writer.buffered()) catch {};
+    std.process.exit(code);
+}
+
+fn failCredentialParse(comptime verb: []const u8, comptime params: []const clap.Param(clap.Help), diag: clap.Diagnostic, err: anyerror) noreturn {
+    failCredentialParseDynamic(verb, params, diag, err);
+}
+
+fn failCredentialParseDynamic(verb: []const u8, comptime params: []const clap.Param(clap.Help), diag: clap.Diagnostic, err: anyerror) noreturn {
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    diag.report(&writer, err) catch {};
+    std.debug.print("glolias credential {s}: {s}\n", .{ verb, writer.buffered() });
+    credentialSubcommandHelpDynamic(verb, params, 2);
+}
+
+fn failCredentialUsage(comptime verb: []const u8, comptime params: []const clap.Param(clap.Help)) noreturn {
+    credentialSubcommandHelpDynamic(verb, params, 2);
+}
+
+fn failCredentialUsageDynamic(verb: []const u8, comptime params: []const clap.Param(clap.Help)) noreturn {
+    credentialSubcommandHelpDynamic(verb, params, 2);
 }
 
 fn helpOptions() clap.HelpOptions {

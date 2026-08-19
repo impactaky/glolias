@@ -11,11 +11,26 @@ pub fn configFilePath(allocator: std.mem.Allocator) ![]const u8 {
         else => return err,
     };
     defer allocator.free(config_home);
-
     return std.fs.path.join(allocator, &.{ config_home, "glolias", "config.toml" });
 }
 
 pub fn defaultShimsDir(allocator: std.mem.Allocator) ![]const u8 {
+    const root = try dataRoot(allocator);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "shims" });
+}
+
+pub fn defaultCredentialsDir(allocator: std.mem.Allocator) ![]const u8 {
+    const root = try dataRoot(allocator);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "credentials" });
+}
+
+pub fn credentialRunnerPath(allocator: std.mem.Allocator, credentials_dir: []const u8, name: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ credentials_dir, name });
+}
+
+fn dataRoot(allocator: std.mem.Allocator) ![]const u8 {
     const data_home = getEnvOwned(allocator, "XDG_DATA_HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => blk: {
             const home = try homeDir(allocator);
@@ -25,31 +40,22 @@ pub fn defaultShimsDir(allocator: std.mem.Allocator) ![]const u8 {
         else => return err,
     };
     defer allocator.free(data_home);
-
-    return std.fs.path.join(allocator, &.{ data_home, "glolias", "shims" });
+    return std.fs.path.join(allocator, &.{ data_home, "glolias" });
 }
 
 pub fn expandPath(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, input, "~")) {
-        return homeDir(allocator);
-    }
-
+    if (std.mem.eql(u8, input, "~")) return homeDir(allocator);
     if (std.mem.startsWith(u8, input, "~/")) {
         const home = try homeDir(allocator);
         defer allocator.free(home);
         return std.fs.path.join(allocator, &.{ home, input[2..] });
     }
-
     if (std.mem.startsWith(u8, input, "$HOME/")) {
         const home = try homeDir(allocator);
         defer allocator.free(home);
         return std.fs.path.join(allocator, &.{ home, input[6..] });
     }
-
-    if (std.fs.path.isAbsolute(input)) {
-        return allocator.dupe(u8, input);
-    }
-
+    if (std.fs.path.isAbsolute(input)) return allocator.dupe(u8, input);
     const cwd = try sys.cwdAlloc(allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, input });
@@ -60,9 +66,7 @@ pub fn selfExePath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn ensureParentDir(path: []const u8) sys.CreateDirPathError!void {
-    if (std.fs.path.dirname(path)) |parent| {
-        try sys.mkdirp(parent);
-    }
+    if (std.fs.path.dirname(path)) |parent| try sys.mkdirp(parent);
 }
 
 fn homeDir(allocator: std.mem.Allocator) ![]const u8 {

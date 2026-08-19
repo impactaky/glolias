@@ -238,6 +238,25 @@ pub fn selfExePath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn listSymlinks(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
+    const entries = try listEntries(allocator, dir_path);
+    defer {
+        for (entries) |item| allocator.free(item);
+        allocator.free(entries);
+    }
+    var out = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+    for (entries) |name| {
+        const entry_path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(entry_path);
+        if (try pathKind(allocator, entry_path) == .symlink) try out.append(allocator, try allocator.dupe(u8, name));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn listEntries(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
     const z_dir = try allocator.dupeZ(u8, dir_path);
     defer allocator.free(z_dir);
     const dir = c.opendir(z_dir.ptr) orelse return error.OpenDirFailed;
@@ -253,11 +272,7 @@ pub fn listSymlinks(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
         const name_ptr: [*]const u8 = @ptrCast(&entry.name);
         const name = name_ptr[0..cStringLen(name_ptr)];
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        const entry_path = try std.fs.path.join(allocator, &.{ dir_path, name });
-        defer allocator.free(entry_path);
-        if (try pathKind(allocator, entry_path) == .symlink) {
-            try out.append(allocator, try allocator.dupe(u8, name));
-        }
+        try out.append(allocator, try allocator.dupe(u8, name));
     }
 
     return out.toOwnedSlice(allocator);
