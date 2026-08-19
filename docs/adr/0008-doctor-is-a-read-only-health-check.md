@@ -13,13 +13,17 @@ after the first failure. Its checks cover:
 - executables before the Shims directory that shadow configured Aliases;
 - a missing, dangling, stale, or non-symlink entry for each configured Alias;
 - orphan symlinks that do not correspond to configured Aliases.
+- missing, malformed, non-executable, stale, mismatched, and orphan Credential
+  Runners;
+- dangling Credential Bindings and duplicate environment-variable providers.
 
 A config failure prevents checks that need the Alias set, but does not prevent
 independent directory, `PATH`, binary-target, or symlink inspection. A Shims
 directory failure likewise does not prevent config, `PATH`, or configured-entry
 checks.
 
-Shim inconsistencies include guidance to run `glolias sync`. `doctor` itself
+Shim and stale-Runner inconsistencies include guidance to run `glolias sync`;
+missing or invalid Runners require `glolias credential set`. `doctor` itself
 does not create, remove, or repoint symlinks and does not modify config or
 `PATH`. As established by ADR 0004, all environment checks describe only the
 shell that launched `doctor`; a GUI application or IDE can have a different

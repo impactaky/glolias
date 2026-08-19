@@ -5,7 +5,7 @@ load test_helper/common
 @test "add writes a config entry and creates its shim" {
   glolias add gh op plugin run -- gh
 
-  assert_config_line 'gh = ["op", "plugin", "run", "--", "gh"]'
+  assert_config_line 'gh.tokens = ["op", "plugin", "run", "--", "gh"]'
   refute_config_line 'shims_dir = '
   assert_shim_points_to_current_binary gh
 }
@@ -14,7 +14,7 @@ load test_helper/common
   for name in "a" "A0" "_local" "foo-bar"
   do
     glolias add "$name" echo "$name"
-    assert_config_line "$name = [\"echo\", \"$name\"]"
+    assert_config_line "$name.tokens = [\"echo\", \"$name\"]"
     assert_shim_points_to_current_binary "$name"
   done
 }
@@ -23,8 +23,8 @@ load test_helper/common
   glolias add gs git -c color.ui=always status
   glolias add hh curl --help
 
-  assert_config_line 'gs = ["git", "-c", "color.ui=always", "status"]'
-  assert_config_line 'hh = ["curl", "--help"]'
+  assert_config_line 'gs.tokens = ["git", "-c", "color.ui=always", "status"]'
+  assert_config_line 'hh.tokens = ["curl", "--help"]'
 }
 
 @test "re-adding is idempotent unless tokens conflict" {
@@ -38,7 +38,7 @@ load test_helper/common
 
   run glolias add --force gh echo OTHER
   assert_success
-  assert_config_line 'gh = ["echo", "OTHER"]'
+  assert_config_line 'gh.tokens = ["echo", "OTHER"]'
 }
 
 @test "unsupported Alias names fail before changing config or shims" {
@@ -81,9 +81,10 @@ load test_helper/common
 
 @test "config save failure after Alias insertion exits normally" {
   glolias add keep echo stable
-  chmod 0444 "$(config_file)"
+  chmod 0555 "$(dirname "$(config_file)")"
 
   run --separate-stderr glolias add unsaved echo value
+  chmod 0755 "$(dirname "$(config_file)")"
 
   assert_equal "$status" 1
   refute_output
@@ -91,7 +92,7 @@ load test_helper/common
   refute_stderr --partial "Double free"
   refute_stderr --partial "General protection exception"
   refute_stderr --partial "Segmentation fault"
-  refute_config_line "unsaved = "
+  refute_config_line "unsaved.tokens = "
   assert [ ! -e "$(shims_dir)/unsaved" ]
 }
 
@@ -106,7 +107,7 @@ load test_helper/common
   refute_stderr --partial "Double free"
   refute_stderr --partial "General protection exception"
   refute_stderr --partial "Segmentation fault"
-  assert_config_line 'blocked = ["echo", "value"]'
+  refute_config_line 'blocked.tokens = ["echo", "value"]'
   assert [ ! -L "$(shims_dir)/blocked" ]
 }
 
@@ -136,7 +137,7 @@ load test_helper/common
   assert_stderr --partial "glolias add: cannot create shims directory '$XDG_DATA_HOME/glolias/shims'"
   assert_stderr --partial "a parent path is not a directory"
   refute_stderr --partial "MkdirFailed"
-  assert_config_line 'gh = ["echo", "value"]'
+  refute_config_line 'gh.tokens = ["echo", "value"]'
 }
 
 @test "created directories remain 0755 with a permissive umask" {
@@ -209,10 +210,10 @@ gitlog	echo long'
 
   assert_success
   assert [ ! -L "$(shims_dir)/bad" ]
-  refute_config_line 'bad = '
+  refute_config_line 'bad.tokens = '
 }
 
-@test "remove saves the Alias deletion before reporting a Shim removal failure" {
+@test "remove preflights a blocked Shim before changing the Alias" {
   glolias add blocked echo value
   rm "$(shims_dir)/blocked"
   mkdir "$(shims_dir)/blocked"
@@ -220,7 +221,7 @@ gitlog	echo long'
   run --separate-stderr glolias remove blocked
 
   assert_failure 1
-  refute_config_line 'blocked = '
+  assert_config_line 'blocked.tokens = ["echo", "value"]'
   assert [ -d "$(shims_dir)/blocked" ]
 }
 

@@ -16,11 +16,32 @@ load test_helper/common
     refute_stderr
     assert_output --partial "glolias "
     assert_output --partial "global aliases as PATH-resident shims"
-    assert_output --partial "add [--force] <name> <cmd>..."
+    assert_output --partial "add [--force] [--credential <credential>]... <name> <cmd>..."
+    assert_output --partial "credential <set|attach|detach|list|remove>"
     assert_output --partial "list [--plain]"
     assert_output --partial "doctor"
     assert_output --partial "setup [--remove] [--apply]"
     assert_output --partial "Run 'glolias <command> --help' for details on a command."
+  done
+}
+
+@test "credential help documents the complete secret-free lifecycle" {
+  run --separate-stderr glolias credential --help
+  assert_success
+  refute_stderr
+  assert_output --partial "credential set [--force] <credential> <ENV_NAME>"
+  assert_output --partial "credential attach <credential> <alias>..."
+  assert_output --partial "credential detach <credential> <alias>..."
+  assert_output --partial "credential list"
+  assert_output --partial "credential remove <credential>"
+  assert_output --partial "no reveal or export API"
+
+  for subcommand in set attach detach list remove
+  do
+    run --separate-stderr glolias credential "$subcommand" --help
+    assert_success
+    refute_stderr
+    assert_output --partial "usage: glolias credential $subcommand"
   done
 }
 
@@ -56,7 +77,7 @@ load test_helper/common
 
   run glolias add gh curl --help
   assert_success
-  assert_config_line 'gh = ["curl", "--help"]'
+  assert_config_line 'gh.tokens = ["curl", "--help"]'
 }
 
 @test "doctor and list help include their important notes" {

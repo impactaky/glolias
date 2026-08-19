@@ -20,6 +20,18 @@ A named mapping from a command name to a **token list** (the replacement `argv` 
 
 Explicitly out of scope: interior placeholders (`$1`, `$@` in the middle) and positional consumption. An Alias only ever prepends.
 
+### Credential
+A named secret environment assignment: one portable environment-variable name and one current value. Its name is the stable identity used by Aliases; its value is never part of Alias configuration.
+
+### Credential Binding
+An ordered, Alias-owned association with a Credential. Bindings are many-to-many: an Alias may consume several Credentials, and a Credential may serve several Aliases.
+
+### Credential Runner
+A personalized executable artifact that carries exactly one Credential and can apply it only as part of an authorized Credential Chain. It is an obfuscation and review boundary, not protection from deliberate extraction by the same Unix user.
+
+### Credential Chain
+The ordered, exec-only passage through an Alias's bound Credential Runners before its normal dispatch. A Chain preserves the process boundary while applying each declared Credential exactly once.
+
 ### Shims directory
 The single directory that `glolias` owns and populates with the symlinks (one per Alias) pointing at the dispatcher binary. Its location follows the XDG data path (`${XDG_DATA_HOME:-~/.local/share}/glolias/shims`) so the config stays portable across machines. For Shims to take effect, the user places this directory on `PATH` ahead of the Real commands it shadows. Ordinary installation and Alias management never change the environment; persistent user setup is a separate, explicit operation.
 

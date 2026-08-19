@@ -17,6 +17,7 @@ setup_file() {
   mkdir -p "$COMPILED_FIXTURES"
 
   export GLOLIAS_C_FIXTURES_AVAILABLE=0
+  export GLOLIAS_PTY_FIXTURE_AVAILABLE=0
   if command -v cc >/dev/null 2>&1
   then
     if cc -o "$COMPILED_FIXTURES/empty_argv" "$FIXTURES/empty_argv.c"
@@ -25,6 +26,16 @@ setup_file() {
       then
         export GLOLIAS_C_FIXTURES_AVAILABLE=1
       fi
+    fi
+    pty_lib=()
+    if [ "$(uname -s)" = Linux ]
+    then
+      pty_lib=(-lutil)
+    fi
+    if cc -o "$COMPILED_FIXTURES/pty-secret" "$FIXTURES/pty_secret.c" "${pty_lib[@]}" && \
+      cc -o "$COMPILED_FIXTURES/runner-mutate" "$FIXTURES/runner_mutate.c"
+    then
+      export GLOLIAS_PTY_FIXTURE_AVAILABLE=1
     fi
   fi
 }
@@ -52,6 +63,16 @@ shims_dir() {
 config_file() {
   printf "%s
 " "$XDG_CONFIG_HOME/glolias/config.toml"
+}
+
+credentials_dir() {
+  printf "%s\n" "$XDG_DATA_HOME/glolias/credentials"
+}
+
+credential_set() {
+  local value="$1"
+  shift
+  "$COMPILED_FIXTURES/pty-secret" "$value" "$GLOLIAS_BIN" credential set "$@"
 }
 
 make_stub() {
@@ -88,6 +109,13 @@ require_c_fixture() {
   if [ "${GLOLIAS_C_FIXTURES_AVAILABLE:-0}" != 1 ]
   then
     skip "cc is required to compile C e2e fixtures"
+  fi
+}
+
+require_pty_fixture() {
+  if [ "${GLOLIAS_PTY_FIXTURE_AVAILABLE:-0}" != 1 ]
+  then
+    skip "cc and forkpty are required for Credential e2e fixtures"
   fi
 }
 

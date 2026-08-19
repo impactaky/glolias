@@ -9,10 +9,13 @@ We provide each Alias as a symlink (named e.g. `gh`) in one `PATH`-resident shim
 
 ## Mode detection
 
-The single binary plays two roles, selected by `basename(argv[0])`:
+The single binary has three modes. A valid Credential Runner trailer takes
+precedence; otherwise `basename(argv[0])` selects management or Shim mode:
 
 - `== "glolias"` → **management mode** (`add`/`remove`/`list`/`path`/`sync`/`doctor`).
 - anything else → **shim dispatch** for that name.
+- valid Credential Runner trailer → **Credential Runner mode**, authorized by
+  config and internal Chain state rather than by its filename.
 - empty / degenerate (`""`, `"."`, `"/"`) → hard error, exit 127 (cannot determine alias; see ADR 0002 for why `argv[0]` is the sole source).
 
 The management name `glolias` is **fixed by contract**: the binary must be installed and invoked as `glolias`, and `glolias` is a **reserved** alias name (`add` rejects it). We deliberately did not add a `GLOLIAS_SELF_NAME` override — simplicity over flexibility. Renaming the binary disables management mode by design.

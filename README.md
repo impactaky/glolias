@@ -28,8 +28,13 @@ gs
 The first command above stores:
 
 ```toml
+version = 2
+
+[credentials]
+
 [aliases]
-gh = ["op", "plugin", "run", "--", "gh"]
+gh.tokens = ["op", "plugin", "run", "--", "gh"]
+gh.credentials = []
 ```
 
 Then running:
@@ -46,6 +51,16 @@ op plugin run -- gh pr status
 
 Original arguments are appended as arguments, not re-parsed as shell text, so
 quoting is preserved.
+
+Named Credentials can instead provide a rotated environment value directly to
+selected Aliases without relying on the environment that launched a long-lived
+agent:
+
+```sh
+glolias credential set op OP_SERVICE_ACCOUNT_TOKEN  # reads once from /dev/tty
+glolias add --credential op gh gh
+gh auth status
+```
 
 ## Build
 
@@ -109,17 +124,28 @@ Default paths:
 
 - Config: `${XDG_CONFIG_HOME:-~/.config}/glolias/config.toml`
 - Shims directory: `${XDG_DATA_HOME:-~/.local/share}/glolias/shims`
+- Credential Runners: `${XDG_DATA_HOME:-~/.local/share}/glolias/credentials/<credential>`
 
 Set `XDG_DATA_HOME` to move the Shims directory. The config stays portable and
 does not store the expanded path:
 
 ```toml
-version = 1
+version = 2
+
+[credentials]
+op = "OP_SERVICE_ACCOUNT_TOKEN"
 
 [aliases]
-gh = ["op", "plugin", "run", "--", "gh"]
-gs = ["git", "status"]
+gh.tokens = ["gh"]
+gh.credentials = ["op"]
+gs.tokens = ["git", "status"]
+gs.credentials = []
 ```
+
+Config stores public metadata and Bindings only. It never stores a secret,
+encryption key, nonce, ciphertext, or Runner-private material. Version-1 config
+loads as Aliases with no Credential Bindings; reading or dispatching does not
+rewrite it. The next successful mutation serializes version 2.
 
 ## Persistent setup
 
@@ -168,7 +194,12 @@ supported.
 ## Commands
 
 ```sh
-glolias add [--force] <name> <command> [args...]
+glolias add [--force] [--credential <credential>]... <name> <command> [args...]
+glolias credential set [--force] <credential> <ENV_NAME>
+glolias credential attach <credential> <alias>...
+glolias credential detach <credential> <alias>...
+glolias credential list
+glolias credential remove <credential>
 glolias remove <name>
 glolias sync
 glolias list
@@ -184,6 +215,7 @@ Adds or updates an alias and creates the matching shim symlink.
 ```sh
 glolias add gh op plugin run -- gh
 glolias add gs git -c color.ui=always status
+glolias add --credential op gh gh
 ```
 
 Only flags before `<name>` are parsed by `glolias`. Tokens after the alias name
@@ -196,14 +228,71 @@ Re-adding the same tokens succeeds. Replacing different tokens requires
 glolias add --force gh gh --default
 ```
 
+`--credential` is repeatable and every named Credential must already exist.
+Creation commits the Alias and its complete ordered Binding list as one config
+mutation. With `--force`, the resulting Bindings are exactly the flags supplied;
+omitting every `--credential` clears previous Bindings.
+
 Alias names must match `[A-Za-z0-9_][A-Za-z0-9_-]*`; `glolias` is reserved.
 Names containing `.`, Unicode, whitespace, `:`, `/`, or other characters
 outside that ASCII form are rejected. Quoted TOML keys are not supported.
+
+### `credential set`
+
+Creates or rotates a named Credential Runner. The value is read only from
+`/dev/tty`, never argv, normal stdin, the environment, config, or a provider
+command. TTY echo is disabled during entry and restored on success, failure, or
+handled interruption. Empty values, NUL, and values over 8192 bytes are refused.
+
+```sh
+ssh host
+glolias credential set op OP_SERVICE_ACCOUNT_TOKEN
+```
+
+Rotation is atomic and preserves every Alias Binding. Changing the public
+environment-variable name requires `--force`; rotating only the value does not.
+The installed Runner is owner-readable/executable and not writable (`0500`).
+Credential names match `[A-Za-z0-9_][A-Za-z0-9_-]*`; environment names match
+the portable `[A-Za-z_][A-Za-z0-9_]*` contract.
+
+### `credential attach` and `credential detach`
+
+`attach` adds the existing Credential to each existing Alias; `detach` removes
+only those Bindings. These operations update config atomically, do not prompt,
+and never rewrite or remove the shared Runner.
+
+```sh
+glolias credential attach op gh release-tool
+glolias credential detach op release-tool
+```
+
+### `credential list`
+
+Lists only Credential name, environment-variable name, bound Alias names, and
+safe Runner status (`valid`, `stale`, or a structural error). It never displays
+a value or any ciphertext/key material. There is deliberately no `credential
+get`, secret-showing `show`, or `export` command.
+
+### `credential remove`
+
+Refuses while any Alias remains bound. Once unused, it removes metadata and the
+Runner but never removes Aliases or Shims. Recovery then requires running
+`credential set` and entering the value again.
+
+Management commands preflight referenced objects and target types before their
+first mutation, and each individual config or Runner replacement is atomic. A
+single rename cannot cover both config and a Runner: a process or machine crash
+at that boundary can leave a harmless orphan Runner. `doctor` reports it without
+removing it; no command treats an orphan as an authorized Credential.
 
 ### `sync`
 
 Recreates missing shim symlinks, repoints stale or dangling symlinks at the
 current binary, and prunes orphan symlinks that no longer have a config entry.
+It also atomically refreshes structurally valid Credential Runners onto the
+current glolias executable while preserving their trailers. A missing, corrupt,
+or identity-mismatched Runner cannot be reconstructed and requires `credential
+set`; Sync never invents a value or runs open.
 
 Use this after moving or reinstalling the binary, or after restoring dotfiles on
 a new machine.
@@ -246,6 +335,11 @@ Performs a read-only health check of the current shell environment:
 - Whether every configured Alias has a symlink pointing at the current `glolias`
   binary (including missing, dangling, stale, or non-symlink entries)
 - Whether the shims directory contains orphan symlinks with no config entry
+- Whether each Credential Runner is regular, executable, structurally valid,
+  identity-matched, and based on the current binary
+- Whether Bindings dangle or an Alias binds multiple Credentials that provide
+  the same environment-variable name
+- Whether the credentials directory contains orphan artifacts
 
 `doctor` runs every check that remains possible after an error and reports all
 inconsistencies found. It exits `0` for a healthy setup and `1` if it finds one
@@ -253,7 +347,7 @@ or more inconsistencies, making it suitable for scripts. Reported shim
 inconsistencies include guidance to run `glolias sync`; a blocking regular file
 or directory must be removed first.
 
-The command does not repair shims or change config or `PATH`. It reports only
+The command does not repair shims or Runners or change config or `PATH`. It reports only
 the environment of the shell that runs it. GUI-launched applications and IDEs
 may have a different `PATH`.
 
@@ -267,21 +361,73 @@ When invoked as `glolias`, the binary runs the management CLI.
 When invoked through any other basename, for example `gh`, the binary treats that
 basename as the alias name:
 
-1. Load the config.
-2. If `GLOLIAS_GUARD` already contains the alias name, resolve the real command
-   by searching `PATH` while skipping the configured shims directory.
-3. Otherwise, add the alias name to `GLOLIAS_GUARD`.
-4. Build `argv` as `configured_tokens ++ original_args`.
-5. Replace the current process image with `execvp`.
+1. Load and validate config and the complete ordered Credential Binding list,
+   including rejecting duplicate environment-variable providers.
+2. For a bound Alias, validate every Runner before executing any of them. Then
+   `execv` the first Runner; each Runner authenticates the configured identity
+   and internal Chain state, overwrites its environment value, and `execv`s the
+   next Runner or dispatcher.
+3. Caller-supplied stale chain/guard variables cannot authorize or skip initial
+   injection. Missing, stale, malformed, tampered, unsupported, mismatched, or
+   unauthorized Runners fail closed before the Alias command starts.
+4. After the Chain, use the name-scoped `GLOLIAS_GUARD` to break ordinary Alias
+   recursion and resolve the Real command while skipping the Shims directory.
+5. Build `argv` as `configured_tokens ++ original_args` and replace the process
+   image with `execvp`.
 
-Because the shim uses `exec`, it does not fork and wait. Exit codes, stdin,
-stdout, stderr, cwd, environment, and signals belong to the real command.
+Every Chain transition and final dispatch uses `exec`; glolias never forks and
+waits. Exit codes, stdin, stdout, stderr, cwd, TTY, argument boundaries, signals,
+and the final process identity therefore belong to the real command. Direct Real
+command execution and unbound Shims receive no new Credential from glolias.
 
 Exit behavior for shim-side failures follows shell conventions:
 
 - Command not found: `127`
 - Command present but not executable: `126`
 - Missing config, invalid config, or shim with no config entry: `127`
+- Credential config, Runner, authentication, or Chain refusal: `127` without
+  running the Alias command or falling back to an ambient value
+
+## Credential migration and rotation
+
+For an existing ambient token, perform the one-time migration from an SSH TTY:
+
+1. Run `glolias credential set <name> <ENV_NAME>` and paste the current value at
+   the hidden prompt.
+2. Attach it with `glolias credential attach <name> <alias>...`, or replace an
+   Alias with `glolias add --force --credential <name> ...`.
+3. Verify with `glolias doctor` and the bound command.
+4. Remove the shell-profile export yourself, then restart already-running agents
+   once. Glolias never edits token exports, shell profiles, or system config as
+   part of Credential management.
+
+For later rotation, run the same `credential set` command from any SSH TTY and
+enter the new value. Bindings remain unchanged, and the next invocation observes
+the new value without restarting its caller. After upgrading or moving glolias,
+run `glolias sync` to refresh valid Runners to the installed executable.
+
+## Credential security boundary
+
+A Credential Runner is a personalized copy of glolias with a self-delimiting,
+versioned trailer. The value is protected with fresh OS randomness and an
+authenticated standard-library construction; recovery material is split/masked
+inside the same artifact, and generation rejects any Runner whose raw bytes
+contain the plaintext sequence. Config and ordinary management output contain no
+secret material.
+
+This is obfuscation and a review boundary, not cryptographic protection from the
+same Unix user. The intended agent sandbox makes config and the credentials
+directory readable/executable but not writable. Under that policy, ordinary
+`env`, `cat`, `strings`, direct Real-command execution, and unbound Shims do not
+reveal or receive the value. A determined same-user actor may still extract it
+through binary analysis or modification, debugging, or process-memory
+inspection. Glolias cannot enforce the external read-only policy and provides no
+daemon, keychain, GPG, Secret Service, root/systemd service, provider stdout,
+runtime Zig compiler, export API, or shell-profile mutation.
+
+Runners append bytes without parsing ELF or Mach-O. Current release packaging
+does not code-sign. Modifying a future signed/notarized macOS executable would
+invalidate its signature, so such artifacts require revisiting the Runner format.
 
 ## Release packaging
 
@@ -317,6 +463,7 @@ Background and rationale are in:
 - [docs/adr/0007-zig-for-the-native-dispatcher.md](./docs/adr/0007-zig-for-the-native-dispatcher.md)
 - [docs/adr/0008-doctor-is-a-read-only-health-check.md](./docs/adr/0008-doctor-is-a-read-only-health-check.md)
 - [docs/adr/0009-preview-first-user-environment-setup.md](./docs/adr/0009-preview-first-user-environment-setup.md)
+- [docs/adr/0010-named-sealed-credential-runners.md](./docs/adr/0010-named-sealed-credential-runners.md)
 
 Current scope:
 
