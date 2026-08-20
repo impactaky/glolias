@@ -11,46 +11,67 @@ command.
 This works in contexts that call commands directly with `execvp`, including
 scripts, GUI apps, IDEs, and tools that never source your shell startup files.
 
-## Example
+## Quick Start
+
+Install the latest GitHub Release with
+[mise's GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html),
+then add the glolias Shims directory to future sessions:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+mise use --global github:impactaky/glolias
 
-./zig-out/bin/glolias credential set op OP_SERVICE_ACCOUNT_TOKEN
-# Enter the token at the hidden /dev/tty prompt.
+glolias setup
+glolias setup --apply
 
-./zig-out/bin/glolias add --credential op op op
-
-export PATH="$(./zig-out/bin/glolias path):$PATH"
-
-op vault list
+# setup affects future sessions; make the Shims available in this shell too.
+export PATH="$(glolias path):$PATH"
 ```
 
-This creates an `op` Shim that injects the named Credential and then execs the
-real `op` command. The generated config contains only public metadata and the
-Binding:
+For example, seal a 1Password service-account token and use it only when the
+global `gh` Alias enters `op run`:
+
+```sh
+glolias credential set 1password OP_SERVICE_ACCOUNT_TOKEN
+# Enter the current service-account token at the hidden /dev/tty prompt.
+
+glolias add --credential 1password gh \
+  op run --no-masking -- "$SHELFFILES/result/bin/gh"
+
+gh auth status
+```
+
+Now any process that resolves `gh` through the glolias Shims directory executes:
+
+```sh
+op run --no-masking -- "$SHELFFILES/result/bin/gh" <original gh arguments...>
+```
+
+The `1password` Credential overwrites `OP_SERVICE_ACCOUNT_TOKEN` before `op`
+starts. The generated config contains only public metadata and the Binding:
 
 ```toml
 version = 2
 
 [credentials]
-op = "OP_SERVICE_ACCOUNT_TOKEN"
+1password = "OP_SERVICE_ACCOUNT_TOKEN"
 
 [aliases]
-op.tokens = ["op"]
-op.credentials = ["op"]
+gh.tokens = ["op", "run", "--no-masking", "--", "/absolute/path/to/real/gh"]
+gh.credentials = ["1password"]
 ```
 
-The token itself is stored only in the personalized Credential Runner. To
-rotate it, run the same command and enter the new value:
+The service-account token itself is stored only in the personalized Credential
+Runner. To rotate it, run the same command and enter the new value:
 
 ```sh
-glolias credential set op OP_SERVICE_ACCOUNT_TOKEN
+glolias credential set 1password OP_SERVICE_ACCOUNT_TOKEN
 ```
 
-Bindings do not change, and the next `op` invocation sees the new value even
-when its caller is a long-lived agent. Original arguments are appended as
-arguments, not re-parsed as shell text, so quoting is preserved.
+Bindings do not change, and the next `gh` invocation sees the new value even
+when its caller is a long-lived agent with an old ambient token. Original
+arguments are appended as arguments, not re-parsed as shell text, so quoting is
+preserved. The real `gh` path is expanded when `glolias add` runs and avoids
+recursing back through the `gh` Shim.
 
 ## Build
 
@@ -74,7 +95,22 @@ config schema. CLI argument parsing uses `zig-clap`, fetched by Zig from
 
 ## Install
 
-Release version 0.2.0 provides these archives:
+The recommended installation path is mise's GitHub backend. It selects the
+matching Linux or macOS archive from the latest GitHub Release and exposes
+`glolias` on mise's managed `PATH`:
+
+```sh
+mise use --global github:impactaky/glolias
+```
+
+Then preview and apply the separate persistent Shims-directory setup:
+
+```sh
+glolias setup
+glolias setup --apply
+```
+
+For manual installation, release version 2.0.0 provides these archives:
 
 | Archive suffix | Runtime baseline |
 | --- | --- |
@@ -88,17 +124,17 @@ GitHub Release. Verify the selected archive before extracting it. For example:
 
 ```sh
 # Linux
-grep 'glolias-v0.2.0-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
+grep 'glolias-v2.0.0-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
 
 # macOS
-grep 'glolias-v0.2.0-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check
+grep 'glolias-v2.0.0-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check
 ```
 
 Extract it, place `glolias` at a stable user-selected location already on
 `PATH`, and then preview persistent setup:
 
 ```sh
-tar -xzf glolias-v0.2.0-linux-x86_64.tar.gz
+tar -xzf glolias-v2.0.0-linux-x86_64.tar.gz
 mkdir -p "$HOME/.local/bin"
 install -m 0755 glolias "$HOME/.local/bin/glolias"
 
@@ -107,7 +143,7 @@ glolias setup --apply
 ```
 
 Installation, `add`, `remove`, `sync`, and dispatch never run setup implicitly.
-There is no network installer or `curl | sh` path.
+There is no project-owned network installer or `curl | sh` path.
 
 Default paths:
 
@@ -116,7 +152,7 @@ Default paths:
 - Credential Runners: `${XDG_DATA_HOME:-~/.local/share}/glolias/credentials/<credential>`
 
 Set `XDG_DATA_HOME` to move the Shims directory. The config stays portable and
-does not store the expanded path. As shown in the Example, it stores public
+does not store the expanded path. As shown in the Quick Start, it stores public
 metadata and Bindings only—never a secret, encryption key, nonce, ciphertext,
 or Runner-private material. Version-1 config loads as Aliases with no Credential
 Bindings; reading or dispatching does not rewrite it. The next successful
@@ -410,7 +446,7 @@ On Linux, the local release entry point validates the requested version against
 `SHA256SUMS`:
 
 ```sh
-scripts/package-release.sh 0.2.0 /tmp/glolias-release
+scripts/package-release.sh 2.0.0 /tmp/glolias-release
 ```
 
 Each `glolias-vX.Y.Z-<os>-<arch>.tar.gz` contains executable `glolias`,

@@ -52,18 +52,7 @@ pub fn add(
     }
 
     if (try preflightMutationPaths(allocator, &cfg, name)) |failure| return .{ .directory_failed = failure };
-    {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        var owned_alias = try config.cloneAlias(allocator, tokens, credential_names);
-        errdefer config.deinitAlias(allocator, &owned_alias);
-        if (cfg.aliases.fetchOrderedRemove(name)) |old| {
-            allocator.free(old.key);
-            var old_alias = old.value;
-            config.deinitAlias(allocator, &old_alias);
-        }
-        try cfg.aliases.put(allocator, owned_name, owned_alias);
-    }
+    try cfg.replaceAlias(allocator, name, tokens, credential_names);
     if (try saveConfig(allocator, &cfg)) |failure| return .{ .directory_failed = failure };
     if (try ensureShim(allocator, cfg.shims_dir, name)) |failure| return .{ .directory_failed = failure };
     return .added;
@@ -74,10 +63,7 @@ pub fn remove(allocator: std.mem.Allocator, name: []const u8) !RemoveResult {
     defer cfg.deinit(allocator);
     if (!cfg.aliases.contains(name)) return .not_found;
     if (try preflightMutationPaths(allocator, &cfg, name)) |failure| return .{ .directory_failed = failure };
-    const old = cfg.aliases.fetchOrderedRemove(name).?;
-    allocator.free(old.key);
-    var old_alias = old.value;
-    config.deinitAlias(allocator, &old_alias);
+    _ = cfg.removeAlias(allocator, name);
     if (try saveConfig(allocator, &cfg)) |failure| return .{ .directory_failed = failure };
     const link_path = try std.fs.path.join(allocator, &.{ cfg.shims_dir, name });
     defer allocator.free(link_path);

@@ -15,12 +15,12 @@ const footer_magic = "GLCR-END-V1!";
 const footer_len = 8 + footer_magic.len;
 const fixed_payload_len = payload_magic.len + 2 + 2 + 2 + 4 + Aead.nonce_length + Aead.key_length + Aead.key_length + Aead.tag_length;
 
-pub const chain_env = "GLOLIAS_CREDENTIAL_CHAIN";
-pub const dispatcher_env = "GLOLIAS_CREDENTIAL_DISPATCHER";
-pub const ready_env = "GLOLIAS_CREDENTIAL_READY";
+const chain_env = "GLOLIAS_CREDENTIAL_CHAIN";
+const dispatcher_env = "GLOLIAS_CREDENTIAL_DISPATCHER";
+const ready_env = "GLOLIAS_CREDENTIAL_READY";
 const auth_env_prefix = "GLOLIAS_CREDENTIAL_AUTH_";
 
-pub const Parsed = struct {
+const Parsed = struct {
     bytes: []u8,
     base_len: usize,
     payload_start: usize,
@@ -63,6 +63,7 @@ pub const Parsed = struct {
 };
 
 pub const Status = enum { valid, stale };
+pub const AliasDispatch = enum { alias_command, real_command };
 
 pub fn isSelfRunner(allocator: std.mem.Allocator) !bool {
     const self_path = try paths.selfExePath(allocator);
@@ -107,7 +108,7 @@ pub fn create(
     return error.SecretCiphertextCollision;
 }
 
-pub fn inspectExpected(
+fn inspectExpected(
     allocator: std.mem.Allocator,
     runner_path: []const u8,
     credential: []const u8,
@@ -125,13 +126,35 @@ pub fn inspectExpected(
     return parsed;
 }
 
-pub fn statusAgainstCurrent(allocator: std.mem.Allocator, parsed: *const Parsed) !Status {
+fn statusAgainstCurrent(allocator: std.mem.Allocator, parsed: *const Parsed) !Status {
     const self_path = try paths.selfExePath(allocator);
     defer allocator.free(self_path);
     const current = try sys.readFileAlloc(allocator, self_path, max_runner_len);
     defer allocator.free(current);
     if (current.len == parsed.base_len and std.mem.eql(u8, current, parsed.bytes[0..parsed.base_len])) return .valid;
     return .stale;
+}
+
+pub fn expectedStatus(
+    allocator: std.mem.Allocator,
+    runner_path: []const u8,
+    credential: []const u8,
+    environment: []const u8,
+) !Status {
+    var parsed = try inspectExpected(allocator, runner_path, credential, environment);
+    defer parsed.deinit(allocator);
+    return statusAgainstCurrent(allocator, &parsed);
+}
+
+pub fn expectedStatusOrStale(
+    allocator: std.mem.Allocator,
+    runner_path: []const u8,
+    credential: []const u8,
+    environment: []const u8,
+) !Status {
+    var parsed = try inspectExpected(allocator, runner_path, credential, environment);
+    defer parsed.deinit(allocator);
+    return statusAgainstCurrent(allocator, &parsed) catch .stale;
 }
 
 pub fn refresh(
@@ -161,7 +184,21 @@ pub fn remove(allocator: std.mem.Allocator, runner_path: []const u8) !void {
     }
 }
 
-pub fn preflightAlias(
+pub fn prepareAliasDispatch(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    alias_name: []const u8,
+    alias: *const config.Alias,
+    guarded: bool,
+    rest_args: []const []const u8,
+) !AliasDispatch {
+    try config.validateAliasEnvironments(cfg, alias);
+    if (try consumeReady(allocator, cfg, alias_name, alias)) return .alias_command;
+    if (guarded and try hasActiveAuth(allocator, cfg, alias_name, alias)) return .real_command;
+    try beginChain(allocator, cfg, alias_name, alias, rest_args);
+}
+
+fn preflightAlias(
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
     alias: *const config.Alias,
@@ -182,7 +219,7 @@ pub fn preflightAlias(
     }
 }
 
-pub fn beginChain(
+fn beginChain(
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
     alias_name: []const u8,
@@ -290,7 +327,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) !noreturn {
     sys.execvPath(std.heap.page_allocator, dispatcher, argv);
 }
 
-pub fn consumeReady(
+fn consumeReady(
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
     alias_name: []const u8,
@@ -307,7 +344,7 @@ pub fn consumeReady(
     return true;
 }
 
-pub fn hasActiveAuth(
+fn hasActiveAuth(
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
     alias_name: []const u8,

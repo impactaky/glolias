@@ -20,15 +20,17 @@ pub fn run(allocator: std.mem.Allocator, name: []const u8, rest_args: []const []
     defer allocator.free(guard_value);
 
     if (alias.credential_names.len != 0) {
-        config.validateAliasEnvironments(&cfg, alias) catch |err| failCredential(name, err);
-        const ready = credential_runner.consumeReady(allocator, &cfg, name, alias) catch |err| failCredential(name, err);
-        if (!ready) {
-            const active = if (guardContains(guard_value, name))
-                credential_runner.hasActiveAuth(allocator, &cfg, name, alias) catch |err| failCredential(name, err)
-            else
-                false;
-            if (active) return execReal(allocator, &cfg, name, rest_args);
-            credential_runner.beginChain(allocator, &cfg, name, alias, rest_args) catch |err| failCredential(name, err);
+        const guarded = guardContains(guard_value, name);
+        const action = credential_runner.prepareAliasDispatch(
+            allocator,
+            &cfg,
+            name,
+            alias,
+            guarded,
+            rest_args,
+        ) catch |err| failCredential(name, err);
+        if (action == .real_command) {
+            return execReal(allocator, &cfg, name, rest_args);
         }
     } else if (guardContains(guard_value, name)) {
         return execReal(allocator, &cfg, name, rest_args);

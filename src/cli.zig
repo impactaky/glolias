@@ -23,7 +23,6 @@ const Command = enum {
     path,
     setup,
     doctor,
-    help,
 };
 
 const CmdInfo = struct {
@@ -32,18 +31,58 @@ const CmdInfo = struct {
     usage_args: []const u8,
     summary: []const u8,
     run: *const fn (std.mem.Allocator, []const []const u8) anyerror!void,
+    details: []const u8 = "",
 };
 
 const commands = [_]CmdInfo{
-    .{ .tag = .add, .name = "add", .usage_args = "[--force] [--credential <credential>]... <name> <cmd>...", .summary = "Define an alias + create its shim", .run = add },
-    .{ .tag = .credential, .name = "credential", .usage_args = "<set|attach|detach|list|remove> ...", .summary = "Manage named sealed credentials", .run = credential },
+    .{ .tag = .add, .name = "add", .usage_args = "[--force] [--credential <credential>]... <name> <cmd>...", .summary = "Define an alias + create its shim", .run = add, .details = add_help_details },
+    .{ .tag = .credential, .name = "credential", .usage_args = "<set|attach|detach|list|remove> ...", .summary = "Manage named sealed credentials", .run = credential, .details = credential_help_details },
     .{ .tag = .remove, .name = "remove", .usage_args = "<name>", .summary = "Delete an alias and its shim", .run = remove },
     .{ .tag = .sync, .name = "sync", .usage_args = "", .summary = "Recreate/prune shims to match config", .run = sync },
     .{ .tag = .list, .name = "list", .usage_args = "[--plain]", .summary = "List configured aliases", .run = list },
     .{ .tag = .path, .name = "path", .usage_args = "", .summary = "Print the shims directory", .run = printPath },
-    .{ .tag = .doctor, .name = "doctor", .usage_args = "", .summary = "Check setup; exit 1 on inconsistencies", .run = doctor },
-    .{ .tag = .setup, .name = "setup", .usage_args = "[--remove] [--apply]", .summary = "Preview or apply persistent user setup", .run = configureSetup },
+    .{ .tag = .doctor, .name = "doctor", .usage_args = "", .summary = "Check setup; exit 1 on inconsistencies", .run = doctor, .details = doctor_help_details },
+    .{ .tag = .setup, .name = "setup", .usage_args = "[--remove] [--apply]", .summary = "Preview or apply persistent user setup", .run = configureSetup, .details = setup_help_details },
 };
+
+const add_help_details =
+    \\
+    \\Alias names must match [A-Za-z0-9_][A-Za-z0-9_-]*;
+    \\'glolias' is reserved.
+    \\
+    \\Tokens after <name> are stored verbatim; leading-dash args are safe
+    \\and not parsed by glolias.
+    \\
+;
+
+const credential_help_details =
+    \\Credential values are accepted only from /dev/tty with echo disabled.
+    \\There is no get, show-secret, or export operation. Run
+    \\'glolias credential --help' for lifecycle commands.
+    \\
+;
+
+const doctor_help_details =
+    \\
+    \\Runs every inspectable check without changing config, shims, or PATH.
+    \\Exits 0 when the setup is healthy and 1 when any inconsistency is found.
+    \\Run 'glolias sync' to repair reported shim inconsistencies.
+    \\
+    \\The diagnosis reflects the current shell environment only; GUI IDE
+    \\environments may differ.
+    \\
+;
+
+const setup_help_details =
+    \\
+    \\Preview is the default and never changes files. --apply is the sole
+    \\authorization to apply the complete preflighted plan. --remove previews
+    \\only glolias-owned state; combine it with --apply to remove that state.
+    \\
+    \\Setup never changes the current PATH or OS session. Applied changes take
+    \\effect after a new login/session.
+    \\
+;
 
 const command_params = clap.parseParamsComptime(
     \\-h, --help  Display help and exit.
@@ -349,18 +388,16 @@ fn credentialList(allocator: std.mem.Allocator, args: []const []const u8) !void 
     try main.stdout(allocator, "CREDENTIAL\tENVIRONMENT\tALIASES\tSTATUS\n", .{});
     for (names) |name| {
         const metadata = cfg.credentials.get(name).?;
-        const bound = try credentials_mod.boundAliases(allocator, &cfg, name);
+        const bound = try cfg.boundAliases(allocator, name);
         defer allocator.free(bound);
         const runner_path = try paths.credentialRunnerPath(allocator, cfg.credentials_dir, name);
         defer allocator.free(runner_path);
-        var parsed = credential_runner.inspectExpected(allocator, runner_path, name, metadata.env_name) catch |err| {
+        const status = credential_runner.expectedStatusOrStale(allocator, runner_path, name, metadata.env_name) catch |err| {
             try main.stdout(allocator, "{s}\t{s}\t", .{ name, metadata.env_name });
             try writeJoined(allocator, bound, ",");
             try main.stdout(allocator, "\t{s}\n", .{@errorName(err)});
             continue;
         };
-        defer parsed.deinit(allocator);
-        const status = credential_runner.statusAgainstCurrent(allocator, &parsed) catch .stale;
         try main.stdout(allocator, "{s}\t{s}\t", .{ name, metadata.env_name });
         try writeJoined(allocator, bound, ",");
         try main.stdout(allocator, "\t{s}\n", .{@tagName(status)});
@@ -648,125 +685,10 @@ fn configureSetup(allocator: std.mem.Allocator, args: []const []const u8) !void 
 fn doctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
     parseNoArgCommand(allocator, args, "doctor");
 
-    try main.stdout(allocator, "doctor: current shell environment only; GUI IDE environments may differ\n", .{});
-
-    const report = try doctor_mod.inspect(allocator);
-    defer report.deinit(allocator);
-
-    for (report.findings()) |finding| switch (finding) {
-        .config_ok => try main.stdout(allocator, "config: ok\n", .{}),
-        .config_error => |error_name| try main.stdout(allocator, "config: error: {s}\n", .{error_name}),
-        .shims_dir_ok => |path| try main.stdout(allocator, "shims_dir: ok: {s}\n", .{path}),
-        .shims_dir_missing => |path| try main.stdout(allocator, "shims_dir: missing: {s}\n", .{path}),
-        .shims_dir_not_directory => |finding_data| try main.stdout(
-            allocator,
-            "shims_dir: not a directory ({s}): {s}\n",
-            .{ pathKindName(finding_data.kind), finding_data.subject },
-        ),
-        .shims_dir_inspect_error => |finding_data| try main.stdout(
-            allocator,
-            "shims_dir: unable to inspect: {s}: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .path_present => |position| try main.stdout(
-            allocator,
-            "path: shims_dir present at position {d}\n",
-            .{position},
-        ),
-        .path_missing => {
-            try main.stdout(allocator, "path: shims_dir is not on PATH\n", .{});
-            try main.stdout(allocator, "guidance: run 'glolias setup' to preview persistent PATH setup\n", .{});
-        },
-        .shadowing => |finding_data| try main.stdout(
-            allocator,
-            "shadowing: {s} is shadowed by {s}/{s}\n",
-            .{ finding_data.subject, finding_data.detail, finding_data.subject },
-        ),
-        .binary_error => |error_name| try main.stdout(
-            allocator,
-            "binary: unable to resolve current glolias binary: {s}\n",
-            .{error_name},
-        ),
-        .shim_missing => |name| try main.stdout(allocator, "shim: {s}: missing\n", .{name}),
-        .shim_wrong_kind => |finding_data| try main.stdout(
-            allocator,
-            "shim: {s}: not a symlink ({s})\n",
-            .{ finding_data.subject, pathKindName(finding_data.kind) },
-        ),
-        .shim_inspect_error => |finding_data| try main.stdout(
-            allocator,
-            "shim: {s}: unable to inspect: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .shim_dangling => |name| try main.stdout(
-            allocator,
-            "shim: {s}: dangling or unresolvable symlink\n",
-            .{name},
-        ),
-        .shim_wrong_target => |finding_data| try main.stdout(
-            allocator,
-            "shim: {s}: points to a different glolias binary: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .orphan => |name| try main.stdout(allocator, "orphan: {s}\n", .{name}),
-        .no_orphans => try main.stdout(allocator, "orphans: none\n", .{}),
-        .orphans_skipped => try main.stdout(allocator, "orphans: skipped because config is unavailable\n", .{}),
-        .shims_inspect_error => try main.stdout(allocator, "shims: unable to inspect shims_dir\n", .{}),
-        .credentials_dir_ok => |path| try main.stdout(allocator, "credentials_dir: ok: {s}\n", .{path}),
-        .credentials_dir_missing => |path| try main.stdout(allocator, "credentials_dir: missing: {s}\n", .{path}),
-        .credentials_dir_not_directory => |finding_data| try main.stdout(
-            allocator,
-            "credentials_dir: not a directory ({s}): {s}\n",
-            .{ pathKindName(finding_data.kind), finding_data.subject },
-        ),
-        .credentials_dir_inspect_error => |finding_data| try main.stdout(
-            allocator,
-            "credentials_dir: unable to inspect: {s}: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .credential_runner_ok => |name| try main.stdout(allocator, "credential: {s}: runner ok\n", .{name}),
-        .credential_runner_error => |finding_data| try main.stdout(
-            allocator,
-            "credential: {s}: runner invalid: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .credential_runner_stale => |name| try main.stdout(allocator, "credential: {s}: runner stale\n", .{name}),
-        .credential_duplicate_environment => |finding_data| try main.stdout(
-            allocator,
-            "credential: alias {s}: duplicate environment providers: {s}\n",
-            .{ finding_data.subject, finding_data.detail },
-        ),
-        .credential_orphan => |name| try main.stdout(allocator, "credential orphan: {s}\n", .{name}),
-        .credential_no_orphans => try main.stdout(allocator, "credential orphans: none\n", .{}),
-        .credential_orphans_skipped => try main.stdout(allocator, "credential orphans: skipped because config is unavailable\n", .{}),
-        .credentials_inspect_error => try main.stdout(allocator, "credentials: unable to inspect credentials_dir\n", .{}),
-    };
-
-    if (report.needsShimRepair()) {
-        try main.stdout(allocator, "repair: run 'glolias sync' to repair shims (remove blocking files or directories first)\n", .{});
-    }
-    if (report.needsCredentialSync()) {
-        try main.stdout(allocator, "repair: run 'glolias sync' to refresh stale Credential Runners\n", .{});
-    }
-    if (report.needsCredentialReset()) {
-        try main.stdout(allocator, "repair: run 'glolias credential set <credential> <ENV_NAME>' to recreate missing or invalid runners\n", .{});
-    }
-
-    if (!report.healthy()) {
-        try main.stdout(allocator, "doctor: inconsistencies found\n", .{});
-        std.process.exit(1);
-    }
-    try main.stdout(allocator, "doctor: ok\n", .{});
-}
-
-fn pathKindName(kind: sys.PathKind) []const u8 {
-    return switch (kind) {
-        .missing => "missing",
-        .symlink => "symlink",
-        .directory => "directory",
-        .regular_file => "regular file",
-        .other => "other file type",
-    };
+    var diagnosis = try doctor_mod.diagnose(allocator);
+    defer diagnosis.deinit(allocator);
+    try main.stdout(allocator, "{s}", .{diagnosis.text});
+    if (!diagnosis.healthy) std.process.exit(1);
 }
 
 fn parseNoArgCommand(allocator: std.mem.Allocator, args: []const []const u8, comptime command_name: []const u8) void {
@@ -789,82 +711,37 @@ fn commandHelp(info: *const CmdInfo, code: u8) noreturn {
 
     writer.print("glolias {s} — {s}\n\n", .{ info.name, info.summary }) catch {};
     writer.print("usage: glolias {s}", .{info.name}) catch {};
-    switch (info.tag) {
-        .add => {
-            writer.writeAll(" ") catch {};
-            clap.usage(&writer, clap.Help, &add_params) catch {};
-            writer.writeAll(" <cmd>...") catch {};
-        },
-        .credential => writer.writeAll(" <set|attach|detach|list|remove> ...") catch {},
-        .remove => {
-            writer.writeAll(" ") catch {};
-            clap.usage(&writer, clap.Help, &remove_params) catch {};
-        },
-        .sync, .path, .doctor => {
-            writer.writeAll(" ") catch {};
-            clap.usage(&writer, clap.Help, &no_arg_params) catch {};
-        },
-        .setup => {
-            writer.writeAll(" ") catch {};
-            clap.usage(&writer, clap.Help, &setup_params) catch {};
-        },
-        .list => {
-            writer.writeAll(" ") catch {};
-            clap.usage(&writer, clap.Help, &list_params) catch {};
-        },
-        .help => {},
-    }
-    writer.writeAll("\n\n") catch {};
-    switch (info.tag) {
-        .add => clap.help(&writer, clap.Help, &add_params, helpOptions()) catch {},
-        .credential => {},
-        .remove => clap.help(&writer, clap.Help, &remove_params, helpOptions()) catch {},
-        .sync, .path, .doctor => clap.help(&writer, clap.Help, &no_arg_params, helpOptions()) catch {},
-        .list => clap.help(&writer, clap.Help, &list_params, helpOptions()) catch {},
-        .setup => clap.help(&writer, clap.Help, &setup_params, helpOptions()) catch {},
-        .help => {},
-    }
-    switch (info.tag) {
-        .add => writer.writeAll(
-            \\
-            \\Alias names must match [A-Za-z0-9_][A-Za-z0-9_-]*;
-            \\'glolias' is reserved.
-            \\
-            \\Tokens after <name> are stored verbatim; leading-dash args are safe
-            \\and not parsed by glolias.
-            \\
-        ) catch {},
-        .setup => writer.writeAll(
-            \\
-            \\Preview is the default and never changes files. --apply is the sole
-            \\authorization to apply the complete preflighted plan. --remove previews
-            \\only glolias-owned state; combine it with --apply to remove that state.
-            \\
-            \\Setup never changes the current PATH or OS session. Applied changes take
-            \\effect after a new login/session.
-            \\
-        ) catch {},
-        .doctor => writer.writeAll(
-            \\
-            \\Runs every inspectable check without changing config, shims, or PATH.
-            \\Exits 0 when the setup is healthy and 1 when any inconsistency is found.
-            \\Run 'glolias sync' to repair reported shim inconsistencies.
-            \\
-            \\The diagnosis reflects the current shell environment only; GUI IDE
-            \\environments may differ.
-            \\
-        ) catch {},
-        .credential => writer.writeAll(
-            \\Credential values are accepted only from /dev/tty with echo disabled.
-            \\There is no get, show-secret, or export operation. Run
-            \\'glolias credential --help' for lifecycle commands.
-            \\
-        ) catch {},
-        else => {},
-    }
+    writeCommandParameterHelp(&writer, info.tag);
+    writer.writeAll(info.details) catch {};
 
     sys.writeAll(fd, writer.buffered()) catch {};
     std.process.exit(code);
+}
+
+fn writeCommandParameterHelp(writer: *std.Io.Writer, tag: Command) void {
+    switch (tag) {
+        .add => writeClapCommandParameterHelp(writer, &add_params, " <cmd>..."),
+        .credential => {
+            writer.writeAll(" <set|attach|detach|list|remove> ...") catch {};
+            writer.writeAll("\n\n") catch {};
+        },
+        .remove => writeClapCommandParameterHelp(writer, &remove_params, ""),
+        .sync, .path, .doctor => writeClapCommandParameterHelp(writer, &no_arg_params, ""),
+        .setup => writeClapCommandParameterHelp(writer, &setup_params, ""),
+        .list => writeClapCommandParameterHelp(writer, &list_params, ""),
+    }
+}
+
+fn writeClapCommandParameterHelp(
+    writer: *std.Io.Writer,
+    comptime params: []const clap.Param(clap.Help),
+    suffix: []const u8,
+) void {
+    writer.writeAll(" ") catch {};
+    clap.usage(writer, clap.Help, params) catch {};
+    writer.writeAll(suffix) catch {};
+    writer.writeAll("\n\n") catch {};
+    clap.help(writer, clap.Help, params, helpOptions()) catch {};
 }
 
 fn credentialHelp(code: u8) noreturn {
