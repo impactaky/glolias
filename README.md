@@ -16,51 +16,41 @@ scripts, GUI apps, IDEs, and tools that never source your shell startup files.
 ```sh
 zig build -Doptimize=ReleaseFast
 
-./zig-out/bin/glolias add gh op plugin run -- gh
-./zig-out/bin/glolias add gs git status
+./zig-out/bin/glolias credential set op OP_SERVICE_ACCOUNT_TOKEN
+# Enter the token at the hidden /dev/tty prompt.
+
+./zig-out/bin/glolias add --credential op op op
 
 export PATH="$(./zig-out/bin/glolias path):$PATH"
 
-gh pr status
-gs
+op vault list
 ```
 
-The first command above stores:
+This creates an `op` Shim that injects the named Credential and then execs the
+real `op` command. The generated config contains only public metadata and the
+Binding:
 
 ```toml
 version = 2
 
 [credentials]
+op = "OP_SERVICE_ACCOUNT_TOKEN"
 
 [aliases]
-gh.tokens = ["op", "plugin", "run", "--", "gh"]
-gh.credentials = []
+op.tokens = ["op"]
+op.credentials = ["op"]
 ```
 
-Then running:
+The token itself is stored only in the personalized Credential Runner. To
+rotate it, run the same command and enter the new value:
 
 ```sh
-gh pr status
+glolias credential set op OP_SERVICE_ACCOUNT_TOKEN
 ```
 
-execs:
-
-```sh
-op plugin run -- gh pr status
-```
-
-Original arguments are appended as arguments, not re-parsed as shell text, so
-quoting is preserved.
-
-Named Credentials can instead provide a rotated environment value directly to
-selected Aliases without relying on the environment that launched a long-lived
-agent:
-
-```sh
-glolias credential set op OP_SERVICE_ACCOUNT_TOKEN  # reads once from /dev/tty
-glolias add --credential op gh gh
-gh auth status
-```
+Bindings do not change, and the next `op` invocation sees the new value even
+when its caller is a long-lived agent. Original arguments are appended as
+arguments, not re-parsed as shell text, so quoting is preserved.
 
 ## Build
 
@@ -114,7 +104,6 @@ install -m 0755 glolias "$HOME/.local/bin/glolias"
 
 glolias setup
 glolias setup --apply
-glolias add gh op plugin run -- gh
 ```
 
 Installation, `add`, `remove`, `sync`, and dispatch never run setup implicitly.
@@ -127,25 +116,11 @@ Default paths:
 - Credential Runners: `${XDG_DATA_HOME:-~/.local/share}/glolias/credentials/<credential>`
 
 Set `XDG_DATA_HOME` to move the Shims directory. The config stays portable and
-does not store the expanded path:
-
-```toml
-version = 2
-
-[credentials]
-op = "OP_SERVICE_ACCOUNT_TOKEN"
-
-[aliases]
-gh.tokens = ["gh"]
-gh.credentials = ["op"]
-gs.tokens = ["git", "status"]
-gs.credentials = []
-```
-
-Config stores public metadata and Bindings only. It never stores a secret,
-encryption key, nonce, ciphertext, or Runner-private material. Version-1 config
-loads as Aliases with no Credential Bindings; reading or dispatching does not
-rewrite it. The next successful mutation serializes version 2.
+does not store the expanded path. As shown in the Example, it stores public
+metadata and Bindings only—never a secret, encryption key, nonce, ciphertext,
+or Runner-private material. Version-1 config loads as Aliases with no Credential
+Bindings; reading or dispatching does not rewrite it. The next successful
+mutation serializes version 2.
 
 ## Persistent setup
 
@@ -213,9 +188,8 @@ glolias doctor
 Adds or updates an alias and creates the matching shim symlink.
 
 ```sh
-glolias add gh op plugin run -- gh
+glolias add --credential op op op
 glolias add gs git -c color.ui=always status
-glolias add --credential op gh gh
 ```
 
 Only flags before `<name>` are parsed by `glolias`. Tokens after the alias name
