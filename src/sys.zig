@@ -71,62 +71,40 @@ pub fn writeFileTruncate(allocator: std.mem.Allocator, path: []const u8, data: [
 }
 
 pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    _ = allocator;
     try ensureParentDir(path);
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    const existing_mode = blk: {
+    const permissions = blk: {
         const info = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => break :blk null,
+            error.FileNotFound, error.NotDir => break :blk std.Io.File.Permissions.fromMode(0o644),
             else => return error.StatFailed,
         };
-        break :blk info.permissions.toMode();
+        break :blk info.permissions;
     };
-    var attempt: usize = 0;
-    while (attempt < 100) : (attempt += 1) {
-        const temp_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}.glolias-tmp-{d}-{d}",
-            .{ path, c.getpid(), attempt },
-        );
-        defer allocator.free(temp_path);
+    try writeFileAtomicWithPermissions(path, data, permissions);
+}
 
-        const z_temp = try allocator.dupeZ(u8, temp_path);
-        defer allocator.free(z_temp);
-        const fd = c.open(z_temp.ptr, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .EXCL = true,
-        }, @as(c.mode_t, 0o644));
-        if (fd < 0) {
-            switch (c.errno(-1)) {
-                .EXIST => continue,
-                else => return error.OpenFailed,
-            }
-        }
+pub fn writeFileAtomicMode(path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
+    try ensureParentDir(path);
+    try writeFileAtomicWithPermissions(path, data, .fromMode(mode));
+}
 
-        var fd_open = true;
-        var keep_temp = true;
-        defer {
-            if (fd_open) _ = c.close(fd);
-            if (keep_temp) _ = c.unlink(z_temp.ptr);
-        }
-        if (existing_mode) |mode| {
-            if (c.fchmod(fd, mode) != 0) return error.ChmodFailed;
-        }
+fn writeFileAtomicWithPermissions(
+    path: []const u8,
+    data: []const u8,
+    permissions: std.Io.File.Permissions,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .permissions = permissions,
+        .replace = true,
+    });
+    defer atomic.deinit(io);
 
-        try writeAll(fd, data);
-        if (c.fsync(fd) != 0) return error.SyncFailed;
-        const close_result = c.close(fd);
-        fd_open = false;
-        if (close_result != 0) return error.CloseFailed;
-
-        const z_path = try allocator.dupeZ(u8, path);
-        defer allocator.free(z_path);
-        if (c.rename(z_temp.ptr, z_path.ptr) != 0) return error.RenameFailed;
-        keep_temp = false;
-        return;
-    }
-    return error.TemporaryFileCollision;
+    try atomic.file.writeStreamingAll(io, data);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
 }
 
 pub const CreateDirPathError = std.Io.Dir.CreateDirPathError;
@@ -326,4 +304,57 @@ fn cStringLen(ptr: [*]const u8) usize {
     var i: usize = 0;
     while (ptr[i] != 0) : (i += 1) {}
     return i;
+}
+
+test "atomic writes preserve existing mode and use requested modes for new files" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(parent);
+    const regular = try std.fs.path.join(allocator, &.{ parent, "regular" });
+    defer allocator.free(regular);
+    const runner = try std.fs.path.join(allocator, &.{ parent, "runner" });
+    defer allocator.free(runner);
+
+    try writeFileAtomic(allocator, regular, "first");
+    const new_info = try std.Io.Dir.cwd().statFile(io, regular, .{});
+    try std.testing.expectEqual(@as(u32, 0o644), new_info.permissions.toMode() & 0o777);
+    try std.Io.Dir.cwd().setFilePermissions(io, regular, .fromMode(0o600), .{});
+    try writeFileAtomic(allocator, regular, "second");
+    const regular_info = try std.Io.Dir.cwd().statFile(io, regular, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), regular_info.permissions.toMode() & 0o777);
+    const contents = try readFileAlloc(allocator, regular, 32);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("second", contents);
+
+    try writeFileAtomicMode(runner, "runner", 0o500);
+    const runner_info = try std.Io.Dir.cwd().statFile(io, runner, .{});
+    try std.testing.expectEqual(@as(u32, 0o500), runner_info.permissions.toMode() & 0o777);
+}
+
+test "atomic replace failure cleans its temporary file" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(parent);
+    const destination = try std.fs.path.join(allocator, &.{ parent, "destination" });
+    defer allocator.free(destination);
+    try std.Io.Dir.cwd().createDir(io, destination, .fromMode(0o755));
+
+    if (writeFileAtomicMode(destination, "not installed", 0o644)) |_| {
+        return error.TestExpectedAtomicReplaceFailure;
+    } else |_| {}
+
+    const entries = try listEntries(allocator, parent);
+    defer {
+        for (entries) |entry| allocator.free(entry);
+        allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("destination", entries[0]);
+    try std.testing.expectEqual(PathKind.directory, try pathKind(allocator, destination));
 }

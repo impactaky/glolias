@@ -24,17 +24,29 @@ The Shims directory is derived from `${XDG_DATA_HOME:-~/.local/share}/glolias/sh
 
 ## Considered Options
 
-- **TOML subset (chosen)** — human-friendly, native string arrays store tokens
-  and ordered Bindings losslessly, and the schema needs only its fixed root,
-  `[credentials]`, and `[aliases]` tables. Cost: a small internal
-  parser/serializer rather than a full TOML implementation.
+- **Vendored TOML parser plus project-owned schema adapter and serializer
+  (chosen)** — `tomlc17` provides standards-compliant TOML parsing while the
+  Zig adapter accepts only the fixed glolias root, `[credentials]`, and
+  `[aliases]` schema. The existing serializer keeps deterministic version-2
+  output. The parser's C source is pinned and compiled into glolias, avoiding a
+  runtime shared-library or system-package dependency.
+- **Internal TOML subset parser** — avoids vendored code, but duplicates TOML
+  string, key, array, comment, and table syntax and rejects standard spellings
+  that decode to the same schema.
 - **`std.json`** — zero dependencies and trivially correct round-trip, but config-as-JSON is unpleasant to hand-edit.
 - **Line-based `name = command`** — most pleasant to hand-edit, but forces a hand-rolled shell-quoting parser *and* a mirror-image serializer that must agree forever; rejected.
 - **YAML** — no maintained Zig serializer and overkill for a flat name→list map; rejected.
 
 ## Consequences
 
-- **Internal parser:** `src/config_toml.zig` intentionally supports only the glolias config schema; it is not a vendored third-party TOML library.
+- **Parser/schema ownership:** vendored `tomlc17` owns TOML syntax and returns a
+  decoded tree. `src/config_toml.zig` copies that tree into Zig-owned glolias
+  values while rejecting unknown fields, wrong types, incomplete Aliases, and
+  invalid names or Bindings. The adapter does not re-scan raw TOML to impose a
+  second syntax subset.
+- **Project-owned serialization:** glolias continues to emit deterministic
+  version-2 TOML using canonical bare keys, basic strings, and arrays; no
+  generic encoder or third-party AST is part of the write path.
 - **Machine-managed contract:** Alias and Credential mutations parse → modify →
   re-serialize the whole file, so **hand-added comments and custom formatting are
   not preserved**. The file stays readable (sorted, clean TOML) but `glolias`
@@ -42,5 +54,8 @@ The Shims directory is derived from `${XDG_DATA_HOME:-~/.local/share}/glolias/sh
   was deliberately rejected.
 - **`version` field** made the version-1 to version-2 Alias representation
   migration unambiguous and remains available for future schema evolution.
-- **Alias keys have one shared CLI/config contract:** names match `[A-Za-z0-9_][A-Za-z0-9_-]*`, with `glolias` reserved. The parser and serializer apply that same rule, so CLI-accepted names cannot fail only when saved. Supporting `.`, Unicode, whitespace, `:`, or quoted TOML keys is deliberately outside the schema.
+- **Alias keys have one shared decoded CLI/config contract:** names match
+  `[A-Za-z0-9_][A-Za-z0-9_-]*`, with `glolias` reserved. Standard TOML syntax
+  such as a quoted key is accepted when its decoded name satisfies that same
+  contract; decoded `.`, Unicode, whitespace, or `:` names remain invalid.
 - **No project-local overlays:** Alias resolution uses the single per-user config and never changes with the current working directory. Project-specific environment or command selection belongs to separate tools rather than glolias.

@@ -46,17 +46,19 @@ test "CLI validation and TOML serialization reject the same Alias names" {
     }
 }
 
-test "quoted TOML Alias keys remain unsupported" {
+test "quoted TOML Alias keys use the same decoded name contract" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidInitialCharacter, glolias.config_toml.parseConfig(allocator,
+    var doc = try glolias.config_toml.parseConfig(allocator,
         \\version = 1
         \\
         \\[aliases]
         \\"foo" = ["echo"]
-    ));
+    );
+    defer doc.deinit(allocator);
+    try std.testing.expectEqualStrings("foo", doc.aliases[0].name);
 }
 
-test "internal config TOML parser serializes glolias schema" {
+test "config TOML adapter serializes glolias schema canonically" {
     const allocator = std.testing.allocator;
     var doc = try glolias.config_toml.parseConfig(allocator,
         \\version = 1

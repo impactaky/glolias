@@ -20,5 +20,6 @@
         ".github",
         "CONTEXT.md",
         "docs",
+        "vendor",
     },
 }

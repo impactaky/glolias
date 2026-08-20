@@ -487,35 +487,7 @@ fn preflightTarget(allocator: std.mem.Allocator, path: []const u8) !void {
 
 fn writeAtomicRunner(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     try preflightTarget(allocator, path);
-    var attempt: usize = 0;
-    while (attempt < 100) : (attempt += 1) {
-        const temp = try std.fmt.allocPrint(allocator, "{s}.glolias-tmp-{d}-{d}", .{ path, c.getpid(), attempt });
-        defer allocator.free(temp);
-        const z_temp = try allocator.dupeZ(u8, temp);
-        defer allocator.free(z_temp);
-        const fd = c.open(z_temp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c.mode_t, 0o700));
-        if (fd < 0) {
-            if (c.errno(-1) == .EXIST) continue;
-            return error.OpenFailed;
-        }
-        var open = true;
-        var keep = true;
-        defer {
-            if (open) _ = c.close(fd);
-            if (keep) _ = c.unlink(z_temp.ptr);
-        }
-        try sys.writeAll(fd, bytes);
-        if (c.fsync(fd) != 0) return error.SyncFailed;
-        if (c.fchmod(fd, 0o500) != 0) return error.ChmodFailed;
-        if (c.close(fd) != 0) return error.CloseFailed;
-        open = false;
-        const z_path = try allocator.dupeZ(u8, path);
-        defer allocator.free(z_path);
-        if (c.rename(z_temp.ptr, z_path.ptr) != 0) return error.RenameFailed;
-        keep = false;
-        return;
-    }
-    return error.TemporaryFileCollision;
+    try sys.writeFileAtomicMode(path, bytes, 0o500);
 }
 
 const ChainState = struct {
@@ -715,4 +687,25 @@ test "runner trailer encrypts identity-bound synthetic secrets" {
     const bytes = try buildBytes(allocator, base, "op", "OP_TOKEN", secret);
     defer allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+}
+
+test "Runner atomic write rejects unsafe targets and installs mode 0500" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(parent);
+    const unsafe = try std.fs.path.join(allocator, &.{ parent, "unsafe" });
+    defer allocator.free(unsafe);
+    const runner = try std.fs.path.join(allocator, &.{ parent, "runner" });
+    defer allocator.free(runner);
+
+    try std.Io.Dir.cwd().createDir(io, unsafe, .fromMode(0o755));
+    try std.testing.expectError(error.UnsafeRunnerTarget, writeAtomicRunner(allocator, unsafe, "bytes"));
+    try writeAtomicRunner(allocator, runner, "bytes");
+    try std.Io.Dir.cwd().setFilePermissions(io, runner, .fromMode(0o700), .{});
+    try writeAtomicRunner(allocator, runner, "replacement");
+    const info = try std.Io.Dir.cwd().statFile(io, runner, .{});
+    try std.testing.expectEqual(@as(u32, 0o500), info.permissions.toMode() & 0o777);
 }

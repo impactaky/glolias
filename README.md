@@ -89,9 +89,12 @@ git submodule update --init    # first time only
 zig build e2e                  # end-to-end tests with Bats
 ```
 
-The project includes a small internal TOML subset parser for the machine-managed
-config schema. CLI argument parsing uses `zig-clap`, fetched by Zig from
-`build.zig.zon`.
+Config TOML is parsed by the MIT-licensed `tomlc17` C17 library, vendored and
+pinned under [`vendor/tomlc17`](./vendor/tomlc17/PROVENANCE.md), with its
+[license](./vendor/tomlc17/LICENSE) alongside the source. Its C source is
+compiled directly into the binary, so no system or shared tomlc17 installation
+is needed. glolias owns schema validation and canonical serialization. CLI
+argument parsing uses `zig-clap`, fetched by Zig from `build.zig.zon`.
 
 ## Install
 

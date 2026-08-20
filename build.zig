@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("clap", clap.module("clap"));
+    addTomlc17(b, exe_mod);
 
     const exe = b.addExecutable(.{
         .linkage = if (target.result.os.tag == .linux and target.result.abi == .musl) .static else null,
@@ -29,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     glolias_mod.addImport("clap", clap.module("clap"));
+    addTomlc17(b, glolias_mod);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("tests/unit.zig"),
@@ -61,4 +63,12 @@ pub fn build(b: *std.Build) void {
 
     const e2e_step = b.step("e2e", "Run bats end-to-end tests");
     e2e_step.dependOn(&e2e.step);
+}
+
+fn addTomlc17(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor/tomlc17"));
+    module.addCSourceFile(.{
+        .file = b.path("vendor/tomlc17/tomlc17.c"),
+        .flags = &.{"-std=c17"},
+    });
 }
